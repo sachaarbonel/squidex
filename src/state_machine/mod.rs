@@ -1,4 +1,5 @@
 pub mod machine;
+pub mod raft_impl;
 pub mod scoring;
 pub mod snapshot;
 

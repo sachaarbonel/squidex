@@ -102,43 +102,64 @@ async fn main() -> Result<()> {
     info!("  Similarity metric: {:?}", index_settings.similarity_metric);
 
     // Create state machine
-    let _state_machine = Arc::new(SearchStateMachine::new(index_settings));
+    let state_machine = Arc::new(SearchStateMachine::new(index_settings));
     info!("Search state machine initialized");
 
-    // TODO: Initialize Octopii node
-    // let config = octopii::Config {
-    //     node_id: node_config.node_id,
-    //     bind_addr: node_config.bind_addr.parse()?,
-    //     peers: node_config.peers.iter().map(|p| p.parse()).collect::<Result<Vec<_>, _>>()?,
-    //     wal_dir: node_config.wal_dir(),
-    //     worker_threads: node_config.worker_threads,
-    //     wal_batch_size: node_config.wal_batch_size,
-    //     wal_flush_interval_ms: node_config.wal_flush_interval_ms,
-    //     is_initial_leader: node_config.is_initial_leader,
-    //     snapshot_lag_threshold: node_config.snapshot_lag_threshold,
-    // };
-    //
-    // let node = octopii::OctopiiNode::new(config, state_machine.clone()).await?;
-    // info!("Octopii node initialized");
+    // Initialize Octopii node
+    let config = octopii::Config {
+        node_id: node_config.node_id,
+        bind_addr: node_config.bind_addr.parse()?,
+        peers: node_config
+            .peers
+            .iter()
+            .map(|p| p.parse())
+            .collect::<Result<Vec<_>, _>>()?,
+        wal_dir: node_config.wal_dir(),
+        worker_threads: node_config.worker_threads,
+        wal_batch_size: node_config.wal_batch_size,
+        wal_flush_interval_ms: node_config.wal_flush_interval_ms,
+        is_initial_leader: node_config.is_initial_leader,
+        snapshot_lag_threshold: node_config.snapshot_lag_threshold,
+    };
 
-    // TODO: Start HTTP API server
-    // let app_state = AppState {
-    //     node: Arc::new(node),
-    //     state_machine,
-    // };
-    //
-    // let app = create_router(app_state);
-    // let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    // info!("HTTP API server listening on 0.0.0.0:8080");
-    //
-    // axum::serve(listener, app).await?;
+    // Create runtime
+    let runtime = octopii::OctopiiRuntime::from_handle(tokio::runtime::Handle::current());
+
+    // Create node with custom state machine
+    let node = octopii::OctopiiNode::new_with_state_machine(
+        config,
+        runtime,
+        state_machine.clone() as Arc<dyn octopii::StateMachineTrait>,
+    )
+    .await?;
+    info!("Octopii node initialized");
+
+    // Initialize metrics
+    let metrics = Arc::new(squidex::SearchMetrics::new()?);
+    info!("Metrics initialized");
+
+    // Start HTTP API server
+    let app_state = squidex::AppState {
+        node: Arc::new(node),
+        state_machine,
+        metrics,
+    };
+
+    let app = squidex::create_router(app_state);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+    info!("HTTP API server listening on 0.0.0.0:8080");
 
     info!("Squidex node is ready");
 
-    // For now, just keep the process running
-    // In full implementation, this would handle signals and graceful shutdown
-    tokio::signal::ctrl_c().await?;
-    info!("Received shutdown signal, exiting");
+    // Serve HTTP API
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install CTRL+C signal handler");
+            info!("Received shutdown signal, gracefully shutting down");
+        })
+        .await?;
 
     Ok(())
 }

@@ -441,6 +441,11 @@ impl SearchStateMachine {
         self.settings.read().clone()
     }
 
+    /// Allocate and return the next document ID
+    pub fn next_document_id(&self) -> DocumentId {
+        self.next_doc_id.fetch_add(1, Ordering::SeqCst)
+    }
+
     /// Create a complete snapshot of the search index
     pub fn create_snapshot(&self) -> Vec<u8> {
         let snapshot = SearchSnapshot::new(
