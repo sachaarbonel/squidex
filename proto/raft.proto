@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package squidex.raft;
+
+// Raft RPC service for inter-node communication
+service RaftService {
+    // AppendEntries RPC - used for log replication and heartbeats
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+    // RequestVote RPC - used for leader election
+    rpc Vote(VoteRequest) returns (VoteResponse);
+
+    // InstallSnapshot RPC - used for snapshot transfer
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+// Log ID identifying a specific log entry
+message LogId {
+    uint64 term = 1;
+    uint64 node_id = 2;
+    uint64 index = 3;
+}
+
+// Vote information
+message VoteData {
+    uint64 leader_id = 1;
+    bool committed = 2;
+}
+
+// A single log entry
+message Entry {
+    LogId log_id = 1;
+    bytes payload = 2;
+}
+
+// AppendEntries request
+message AppendEntriesRequest {
+    VoteData vote = 1;
+    LogId prev_log_id = 2;
+    repeated Entry entries = 3;
+    LogId leader_commit = 4;
+}
+
+// AppendEntries response
+message AppendEntriesResponse {
+    VoteData vote = 1;
+    bool success = 2;
+    LogId conflict = 3;
+}
+
+// Vote request for leader election
+message VoteRequest {
+    VoteData vote = 1;
+    LogId last_log_id = 2;
+}
+
+// Vote response
+message VoteResponse {
+    VoteData vote = 1;
+    bool vote_granted = 2;
+    LogId last_log_id = 3;
+}
+
+// Snapshot metadata
+message SnapshotMeta {
+    LogId last_log_id = 1;
+    bytes last_membership = 2;
+    string snapshot_id = 3;
+}
+
+// InstallSnapshot request
+message InstallSnapshotRequest {
+    VoteData vote = 1;
+    SnapshotMeta meta = 2;
+    uint64 offset = 3;
+    bytes data = 4;
+    bool done = 5;
+}
+
+// InstallSnapshot response
+message InstallSnapshotResponse {
+    VoteData vote = 1;
+}

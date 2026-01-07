@@ -1,9 +1,9 @@
 # Squidex
 
-A production-ready **distributed keyword & vector search engine** built on the [Octopii](https://github.com/octopii-rs/octopii) distributed systems kernel.
+A production-ready **distributed keyword & vector search engine** built with Rust, OpenRaft, and gRPC.
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-31%20passing-success)]()
+[![Tests](https://img.shields.io/badge/tests-34%20passing-success)]()
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)]()
 
 ## Features
@@ -15,15 +15,14 @@ A production-ready **distributed keyword & vector search engine** built on the [
 - **Metadata Filtering** - Filter by tags, source, date range, or custom fields
 
 ### Distributed Systems
-- **Raft Consensus** - Strong consistency via Octopii's Raft implementation
-- **Crash Recovery** - Durable Write-Ahead Log (WAL) with automatic recovery
-- **QUIC Transport** - Encrypted, multiplexed peer-to-peer communication
+- **Raft Consensus** - Strong consistency via OpenRaft
+- **gRPC Transport** - Efficient, encrypted peer-to-peer communication
 - **Automatic Failover** - Leader election and replication across 3-7 nodes
+- **Snapshot & Recovery** - Durable persistence with automatic recovery
 
 ### Performance
 - **Configurable Profiles** - Low-latency, balanced, high-throughput, and durable modes
 - **Batch Operations** - Efficient bulk indexing and deletion
-- **Read Consistency** - Local, leader, or linearizable read options
 - **Concurrent Access** - Lock-free reads with RwLock-based state management
 
 ## Architecture
@@ -31,7 +30,7 @@ A production-ready **distributed keyword & vector search engine** built on the [
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        Client Layer                          │
-│  REST API │ gRPC │ SDK │ CLI                                 │
+│  REST API (8080) │ gRPC │ SDK │ CLI                          │
 └──────────────────────────┬───────────────────────────────────┘
                            │
               ┌────────────┴─────────────┐
@@ -44,7 +43,8 @@ A production-ready **distributed keyword & vector search engine** built on the [
         ▼                  ▼                  ▼
    ┌────────┐         ┌────────┐         ┌────────┐
    │ Node 1 │ ◄────► │ Node 2 │ ◄────► │ Node 3 │
-   │(LEADER)│         │(FOLLOW)│         │(FOLLOW)│
+   │(LEADER)│  gRPC   │(FOLLOW)│  gRPC   │(FOLLOW)│
+   │ :5001  │         │ :5001  │         │ :5001  │
    └────────┘         └────────┘         └────────┘
 ```
 
@@ -53,8 +53,9 @@ Each node contains:
 - **Inverted Index** - Term → Document mapping
 - **Vector Store** - Embedding storage
 - **Metadata Indices** - Tag, source, date indices
-- **Octopii Raft** - Consensus layer
-- **WAL** - Durable persistence
+- **OpenRaft** - Consensus layer
+- **gRPC Service** - Inter-node communication (port 5001)
+- **HTTP API** - Client interface (port 8080)
 
 ## Quick Start
 
@@ -75,6 +76,7 @@ cargo build --release
 cargo run --release -- \
   --node-id 1 \
   --bind-addr 127.0.0.1:5001 \
+  --http-addr 127.0.0.1:8080 \
   --data-dir ./data/node1 \
   --is-initial-leader \
   --profile balanced \
@@ -88,7 +90,8 @@ cargo run --release -- \
 cargo run --release -- \
   --node-id 1 \
   --bind-addr 10.0.0.1:5001 \
-  --peers 10.0.0.2:5002,10.0.0.3:5003 \
+  --http-addr 10.0.0.1:8080 \
+  --peers 10.0.0.2:5001,10.0.0.3:5001 \
   --data-dir /data/node1 \
   --is-initial-leader
 ```
@@ -97,8 +100,9 @@ cargo run --release -- \
 ```bash
 cargo run --release -- \
   --node-id 2 \
-  --bind-addr 10.0.0.2:5002 \
-  --peers 10.0.0.1:5001,10.0.0.3:5003 \
+  --bind-addr 10.0.0.2:5001 \
+  --http-addr 10.0.0.2:8080 \
+  --peers 10.0.0.1:5001,10.0.0.3:5001 \
   --data-dir /data/node2
 ```
 
@@ -106,12 +110,67 @@ cargo run --release -- \
 ```bash
 cargo run --release -- \
   --node-id 3 \
-  --bind-addr 10.0.0.3:5003 \
-  --peers 10.0.0.1:5001,10.0.0.2:5002 \
+  --bind-addr 10.0.0.3:5001 \
+  --http-addr 10.0.0.3:8080 \
+  --peers 10.0.0.1:5001,10.0.0.2:5001 \
   --data-dir /data/node3
 ```
 
-## Usage
+## HTTP API
+
+### Index a Document
+
+```bash
+curl -X POST http://localhost:8080/documents \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": 1,
+    "content": "Rust is a systems programming language",
+    "embedding": [0.1, 0.2, 0.3],
+    "metadata": {
+      "title": "About Rust",
+      "tags": ["programming", "rust"]
+    }
+  }'
+```
+
+### Keyword Search
+
+```bash
+curl "http://localhost:8080/search?q=rust+programming&limit=10"
+```
+
+### Vector Search
+
+```bash
+curl -X POST http://localhost:8080/search/vector \
+  -H "Content-Type: application/json" \
+  -d '{
+    "embedding": [0.1, 0.2, 0.3],
+    "limit": 10
+  }'
+```
+
+### Hybrid Search
+
+```bash
+curl -X POST http://localhost:8080/search/hybrid \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "rust programming",
+    "embedding": [0.1, 0.2, 0.3],
+    "limit": 10,
+    "keyword_weight": 0.5
+  }'
+```
+
+### Cluster Status
+
+```bash
+curl http://localhost:8080/cluster/status
+```
+
+## Rust SDK Usage
 
 ### Indexing Documents
 
@@ -126,7 +185,7 @@ let machine = SearchStateMachine::new(settings);
 let doc = Document {
     id: 1,
     content: "Rust is a systems programming language".to_string(),
-    embedding: vec![0.1, 0.2, 0.3, ...], // 384 dimensions
+    embedding: vec![0.1, 0.2, 0.3], // Match your vector dimensions
     metadata: DocumentMetadata {
         title: Some("About Rust".to_string()),
         tags: vec!["programming".to_string(), "rust".to_string()],
@@ -155,7 +214,7 @@ for result in results {
 
 ```rust
 // Similarity search with embedding
-let query_embedding = vec![0.1, 0.2, 0.3, ...];
+let query_embedding = vec![0.1, 0.2, 0.3];
 let results = machine.vector_search(&query_embedding, 10);
 ```
 
@@ -177,12 +236,12 @@ let results = machine.hybrid_search(
 
 Choose a profile based on your workload:
 
-| Profile | wal_batch_size | wal_flush_interval_ms | Use Case |
-|---------|---------------|-----------------------|----------|
-| **Low Latency** | 10 | 10 | Real-time search |
-| **Balanced** | 100 | 50 | General purpose (default) |
-| **High Throughput** | 1,000 | 200 | Bulk indexing |
-| **Durable** | 1 | 0 | Financial/audit logs |
+| Profile | Batch Size | Flush Interval | Use Case |
+|---------|------------|----------------|----------|
+| **Low Latency** | 10 | 10ms | Real-time search |
+| **Balanced** | 100 | 50ms | General purpose (default) |
+| **High Throughput** | 1,000 | 200ms | Bulk indexing |
+| **Durable** | 1 | 0ms | Financial/audit logs |
 
 ```bash
 cargo run -- --profile low-latency  # or balanced, high-throughput, durable
@@ -220,21 +279,26 @@ Options:
           [env: SQUIDEX_NODE_ID]
 
   --bind-addr <BIND_ADDR>
-          Bind address for this node
+          gRPC bind address for Raft communication
           [env: SQUIDEX_BIND_ADDR]
           [default: 127.0.0.1:5001]
 
+  --http-addr <HTTP_ADDR>
+          HTTP API bind address
+          [env: SQUIDEX_HTTP_ADDR]
+          [default: 127.0.0.1:8080]
+
   --peers <PEERS>
-          Comma-separated list of peer addresses
+          Comma-separated list of peer gRPC addresses
           [env: SQUIDEX_PEERS]
 
   --data-dir <DATA_DIR>
-          Data directory for WAL and snapshots
+          Data directory for logs and snapshots
           [env: SQUIDEX_DATA_DIR]
           [default: ./data]
 
   --is-initial-leader
-          Whether this node is the initial leader
+          Whether this node bootstraps the cluster
           [env: SQUIDEX_INITIAL_LEADER]
 
   --profile <PROFILE>
@@ -281,10 +345,12 @@ Choose from three similarity metrics:
 
 ### Raft Consensus
 
+Powered by [OpenRaft](https://github.com/datafuselabs/openraft):
+
 - **Leader Election** - Automatic leader election on startup and failures
 - **Log Replication** - Commands replicated to majority before committing
 - **Snapshots** - Periodic snapshots for fast recovery
-- **Read Consistency** - Configurable consistency levels
+- **gRPC Transport** - Efficient binary protocol for inter-node communication
 
 ## Testing
 
@@ -313,36 +379,38 @@ cargo bench
   - Snapshot/restore
   - Search operations
 
+- **3 integration tests** covering:
+  - Single node operations
+  - Vector and hybrid search
+  - Snapshot and restore
+
 ## Development Status
 
-### ✅ Completed
+### Completed
 - [x] Core data models (Document, Command, SearchRequest)
 - [x] Tokenizer with stemming and stopword removal
 - [x] BM25, cosine, euclidean, dot product scoring
 - [x] Inverted index for keyword search
 - [x] Vector store for similarity search
 - [x] Metadata indices (tags, source, date)
-- [x] SearchStateMachine with StateMachineTrait
+- [x] SearchStateMachine
 - [x] Snapshot/restore functionality
 - [x] Configuration system with performance profiles
 - [x] CLI binary with argument parsing
-- [x] Comprehensive unit tests (31 tests passing)
+- [x] OpenRaft consensus integration
+- [x] gRPC inter-node communication
+- [x] HTTP REST API layer
+- [x] Comprehensive tests (34 tests passing)
 
-### 🚧 In Progress
-- [ ] Octopii integration (Raft, WAL, QUIC)
-- [ ] HTTP REST API layer
+### Planned
 - [ ] Metrics and monitoring (Prometheus)
-- [ ] Health checks
-- [ ] Integration tests (cluster tests)
-
-### 📋 Planned
-- [ ] gRPC API
+- [ ] Health checks and readiness probes
 - [ ] Client SDKs (Rust, Python, Go)
 - [ ] Web UI dashboard
 - [ ] HNSW index for faster vector search
 - [ ] Sharding for horizontal scaling
-- [ ] Compression for snapshots
 - [ ] Query DSL
+- [ ] TLS for gRPC
 
 ## Performance
 
@@ -375,18 +443,19 @@ Choose the license that best suits your project.
 
 ## Acknowledgments
 
-- **Octopii** - Distributed systems kernel providing Raft, WAL, and QUIC
-- **OpenRaft** - Rust Raft consensus implementation
-- **Tantivy** - Inspiration for full-text search design
-- **Qdrant** - Inspiration for vector search design
+- **[OpenRaft](https://github.com/datafuselabs/openraft)** - Rust Raft consensus implementation
+- **[Tonic](https://github.com/hyperium/tonic)** - gRPC framework for Rust
+- **[Axum](https://github.com/tokio-rs/axum)** - Web framework for Rust
+- **[Tantivy](https://github.com/quickwit-oss/tantivy)** - Inspiration for full-text search design
+- **[Qdrant](https://github.com/qdrant/qdrant)** - Inspiration for vector search design
 
 ## References
 
 - [Raft Consensus Algorithm](https://raft.github.io/)
 - [BM25 Ranking Function](https://en.wikipedia.org/wiki/Okapi_BM25)
 - [Vector Similarity Search](https://www.pinecone.io/learn/vector-similarity/)
-- [SPEC.md](./SPEC.md) - Complete production specification
+- [OpenRaft Documentation](https://datafuselabs.github.io/openraft/)
 
 ---
 
-**Built with ❤️ in Rust**
+**Built with Rust**

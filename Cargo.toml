@@ -1,11 +1,11 @@
 [package]
 name = "squidex"
-version = "1.0.0"
+version = "2.1.0"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT OR Apache-2.0"
 authors = ["Sacha Arbonel"]
-description = "Distributed keyword & vector search engine built on Octopii"
+description = "Production-ready distributed hybrid search engine"
 repository = "https://github.com/sachaarbonel/squidex"
 keywords = ["search", "vector", "distributed", "raft", "bm25"]
 categories = ["database-implementations", "data-structures"]
@@ -15,16 +15,28 @@ name = "squidex"
 path = "bin/squidex.rs"
 
 [dependencies]
-# Octopii distributed systems kernel (Raft + WAL + QUIC)
-octopii = { git = "https://github.com/octopii-rs/octopii", features = ["openraft"] }
+# Consensus (OpenRaft)
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+
+# Networking (gRPC)
+tonic = { version = "0.11", features = ["tls", "gzip"] }
+prost = "0.12"
+hyper = { version = "1.1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+
+# Storage (RocksDB for WAL)
+rocksdb = { version = "0.22", features = ["multi-threaded-cf"] }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+futures = "0.3"
 
 # HTTP server
 axum = { version = "0.7", features = ["macros"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "compression-full"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -34,6 +46,8 @@ bytes = "1.5"
 
 # Concurrency
 parking_lot = "0.12"
+dashmap = "5.5"
+crossbeam = "0.8"
 
 # Text processing
 unicode-segmentation = "1.11"
@@ -51,6 +65,10 @@ anyhow = "1.0"
 num_cpus = "1.16"
 chrono = "0.4"
 clap = { version = "4.4", features = ["derive", "env"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+[build-dependencies]
+tonic-build = "0.11"
 
 [dev-dependencies]
 tempfile = "3.9"
@@ -58,5 +76,5 @@ proptest = "1.4"
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"
 codegen-units = 1

@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
-use squidex::{IndexSettings, NodeConfig, PerformanceProfile, SearchStateMachine};
+use squidex::consensus::proto::raft_service_server::RaftServiceServer;
+use squidex::{IndexSettings, NodeConfig, PerformanceProfile, RaftServiceImpl, SearchStateMachine, SquidexNode};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tonic::transport::Server;
 use tracing::{info, warn};
 
 #[derive(Parser)]
@@ -13,7 +15,7 @@ struct Args {
     #[arg(long, env = "SQUIDEX_NODE_ID")]
     node_id: u64,
 
-    /// Bind address for this node
+    /// Bind address for Raft gRPC (inter-node communication)
     #[arg(long, env = "SQUIDEX_BIND_ADDR", default_value = "127.0.0.1:5001")]
     bind_addr: String,
 
@@ -36,6 +38,10 @@ struct Args {
     /// Vector embedding dimensions
     #[arg(long, env = "SQUIDEX_VECTOR_DIM", default_value = "384")]
     vector_dimensions: usize,
+
+    /// HTTP API port
+    #[arg(long, env = "SQUIDEX_HTTP_PORT", default_value = "8080")]
+    http_port: u16,
 }
 
 #[tokio::main]
@@ -86,11 +92,6 @@ async fn main() -> Result<()> {
     info!("  Bind address: {}", node_config.bind_addr);
     info!("  Peers: {:?}", node_config.peers);
     info!("  Data directory: {:?}", node_config.data_dir);
-    info!("  WAL batch size: {}", node_config.wal_batch_size);
-    info!(
-        "  WAL flush interval: {}ms",
-        node_config.wal_flush_interval_ms
-    );
     info!("  Initial leader: {}", node_config.is_initial_leader);
 
     // Create index settings
@@ -105,34 +106,30 @@ async fn main() -> Result<()> {
     let state_machine = Arc::new(SearchStateMachine::new(index_settings));
     info!("Search state machine initialized");
 
-    // Initialize Octopii node
-    let config = octopii::Config {
-        node_id: node_config.node_id,
-        bind_addr: node_config.bind_addr.parse()?,
-        peers: node_config
-            .peers
-            .iter()
-            .map(|p| p.parse())
-            .collect::<Result<Vec<_>, _>>()?,
-        wal_dir: node_config.wal_dir(),
-        worker_threads: node_config.worker_threads,
-        wal_batch_size: node_config.wal_batch_size,
-        wal_flush_interval_ms: node_config.wal_flush_interval_ms,
-        is_initial_leader: node_config.is_initial_leader,
-        snapshot_lag_threshold: node_config.snapshot_lag_threshold,
-    };
+    // Create Squidex node (OpenRaft-based)
+    let node = Arc::new(
+        SquidexNode::new(args.node_id, node_config.clone(), state_machine.clone()).await?,
+    );
+    info!("Raft node created");
 
-    // Create runtime
-    let runtime = octopii::OctopiiRuntime::from_handle(tokio::runtime::Handle::current());
+    // Start Raft node
+    node.start().await?;
+    info!("Raft node started");
 
-    // Create node with custom state machine
-    let node = octopii::OctopiiNode::new_with_state_machine(
-        config,
-        runtime,
-        state_machine.clone() as Arc<dyn octopii::StateMachineTrait>,
-    )
-    .await?;
-    info!("Octopii node initialized");
+    // Start gRPC server for Raft communication
+    let grpc_addr = args.bind_addr.parse()?;
+    let raft_service = RaftServiceImpl::new(node.raft.clone());
+
+    let grpc_server = Server::builder()
+        .add_service(RaftServiceServer::new(raft_service))
+        .serve(grpc_addr);
+
+    tokio::spawn(async move {
+        if let Err(e) = grpc_server.await {
+            tracing::error!("gRPC server error: {}", e);
+        }
+    });
+    info!("gRPC Raft server started on {}", args.bind_addr);
 
     // Initialize metrics
     let metrics = Arc::new(squidex::SearchMetrics::new()?);
@@ -140,14 +137,15 @@ async fn main() -> Result<()> {
 
     // Start HTTP API server
     let app_state = squidex::AppState {
-        node: Arc::new(node),
+        node,
         state_machine,
         metrics,
     };
 
     let app = squidex::create_router(app_state);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-    info!("HTTP API server listening on 0.0.0.0:8080");
+    let http_addr = format!("0.0.0.0:{}", args.http_port);
+    let listener = tokio::net::TcpListener::bind(&http_addr).await?;
+    info!("HTTP API server listening on {}", http_addr);
 
     info!("Squidex node is ready");
 

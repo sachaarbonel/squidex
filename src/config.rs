@@ -45,7 +45,7 @@ impl Default for TokenizerConfig {
     }
 }
 
-/// Node configuration for Octopii
+/// Node configuration for Squidex cluster
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
     pub node_id: u64,

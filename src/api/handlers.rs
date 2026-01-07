@@ -7,6 +7,7 @@ use axum::{
 use std::sync::Arc;
 
 use crate::api::types::{self, *};
+use crate::consensus::LogEntry;
 use crate::error::SquidexError;
 use crate::models::*;
 
@@ -78,15 +79,13 @@ pub async fn index_document(
         updated_at: current_timestamp(),
     };
 
-    let command = Command::IndexDocument(doc);
-    let cmd_bytes = bincode::serialize(&command)
-        .map_err(|e| SquidexError::Serialization(e))?;
+    let entry = LogEntry::IndexDocument(doc);
 
     state
         .node
-        .propose(cmd_bytes)
+        .propose(entry)
         .await
-        .map_err(|e| SquidexError::Internal(e.to_string()))?;
+        .map_err(|e| SquidexError::Consensus(e.to_string()))?;
 
     Ok((StatusCode::CREATED, Json(IndexResponse { id: doc_id })))
 }
@@ -112,15 +111,13 @@ pub async fn delete_document(
         return Err(ApiError::NotLeader);
     }
 
-    let command = Command::DeleteDocument(id);
-    let cmd_bytes = bincode::serialize(&command)
-        .map_err(|e| SquidexError::Serialization(e))?;
+    let entry = LogEntry::DeleteDocument(id);
 
     state
         .node
-        .propose(cmd_bytes)
+        .propose(entry)
         .await
-        .map_err(|e| SquidexError::Internal(e.to_string()))?;
+        .map_err(|e| SquidexError::Consensus(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -192,15 +189,13 @@ pub async fn batch_index(
         })
         .collect();
 
-    let command = Command::BatchIndex(documents);
-    let cmd_bytes = bincode::serialize(&command)
-        .map_err(|e| SquidexError::Serialization(e))?;
+    let entry = LogEntry::BatchIndex(documents);
 
     state
         .node
-        .propose(cmd_bytes)
+        .propose(entry)
         .await
-        .map_err(|e| SquidexError::Internal(e.to_string()))?;
+        .map_err(|e| SquidexError::Consensus(e.to_string()))?;
 
     Ok(StatusCode::CREATED)
 }
@@ -209,20 +204,16 @@ pub async fn batch_index(
 pub async fn cluster_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let conf = state.node.conf_state().await;
+    let membership = state.node.membership().await;
     let is_leader = state.node.is_leader().await;
-    let leader_id = if is_leader {
-        Some(state.node.id())
-    } else {
-        None
-    };
+    let leader_id = state.node.leader_id().await;
 
     let status = ClusterStatus {
         leader_id,
         node_id: state.node.id(),
         is_leader,
-        voters: conf.voters,
-        learners: conf.learners,
+        voters: membership.voters,
+        learners: membership.learners,
         total_documents: state.state_machine.total_documents(),
         index_version: state.state_machine.index_version(),
     };

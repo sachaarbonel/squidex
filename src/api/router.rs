@@ -5,15 +5,15 @@ use axum::{
 use std::sync::Arc;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
+use crate::consensus::SquidexNode;
 use crate::metrics::SearchMetrics;
 use crate::state_machine::SearchStateMachine;
-use octopii::OctopiiNode;
 
 use super::handlers::*;
 
 /// Application state shared across all handlers
 pub struct AppState {
-    pub node: Arc<OctopiiNode>,
+    pub node: Arc<SquidexNode>,
     pub state_machine: Arc<SearchStateMachine>,
     pub metrics: Arc<SearchMetrics>,
 }
