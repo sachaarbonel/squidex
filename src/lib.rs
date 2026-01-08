@@ -4,6 +4,7 @@ pub mod consensus;
 pub mod error;
 pub mod metrics;
 pub mod models;
+pub mod segment;
 pub mod state_machine;
 pub mod tokenizer;
 pub mod vector;

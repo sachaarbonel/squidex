@@ -1,0 +1,568 @@
+//! Segment index combining mutable buffer + immutable segments
+//!
+//! Per SPEC: SegmentIndex = mutable buffer + immutable segments
+//! Provides BM25+ scoring across buffer + segments
+
+use std::collections::{BinaryHeap, HashMap};
+use std::cmp::Ordering;
+use std::io;
+use std::sync::{Arc, RwLock};
+
+use super::buffer::{BufferConfig, MutableBuffer};
+use super::manifest::{ManifestHolder, SegmentManifest};
+use super::reader::{SegmentMeta, SegmentReader};
+use super::statistics::{Bm25Params, IndexStatistics, SegmentStatistics};
+use super::types::{DocNo, DocumentId, RaftIndex, SegmentId, Version};
+use super::writer::SegmentWriter;
+
+/// Search result from the segment index
+#[derive(Clone, Debug)]
+pub struct SearchResult {
+    /// External document ID
+    pub doc_id: DocumentId,
+    /// BM25+ score
+    pub score: f32,
+    /// Source segment (None if from buffer)
+    pub segment_id: Option<SegmentId>,
+}
+
+impl PartialEq for SearchResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score && self.doc_id == other.doc_id
+    }
+}
+
+impl Eq for SearchResult {}
+
+impl PartialOrd for SearchResult {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SearchResult {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse ordering for min-heap behavior (we want top-k highest scores)
+        other
+            .score
+            .partial_cmp(&self.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
+    }
+}
+
+/// Configuration for the segment index
+#[derive(Clone, Debug)]
+pub struct SegmentIndexConfig {
+    /// Buffer configuration
+    pub buffer: BufferConfig,
+    /// BM25 parameters
+    pub bm25: Bm25Params,
+    /// Maximum number of segments before forcing merge
+    pub max_segments: usize,
+}
+
+impl Default for SegmentIndexConfig {
+    fn default() -> Self {
+        Self {
+            buffer: BufferConfig::default(),
+            bm25: Bm25Params::default(),
+            max_segments: 10,
+        }
+    }
+}
+
+/// The main segment-based index
+///
+/// Combines a mutable buffer for recent writes with immutable segments
+/// for efficient BM25+ search.
+pub struct SegmentIndex {
+    /// Mutable buffer for recent writes
+    buffer: RwLock<MutableBuffer>,
+    /// Immutable segment readers
+    segments: RwLock<Vec<Arc<SegmentReader>>>,
+    /// Segment manifest
+    manifest: ManifestHolder,
+    /// Index configuration
+    config: SegmentIndexConfig,
+}
+
+impl SegmentIndex {
+    /// Create a new segment index
+    pub fn new(config: SegmentIndexConfig) -> Self {
+        Self {
+            buffer: RwLock::new(MutableBuffer::new()),
+            segments: RwLock::new(Vec::new()),
+            manifest: ManifestHolder::default(),
+            config,
+        }
+    }
+
+    /// Create with default configuration
+    pub fn default_config() -> Self {
+        Self::new(SegmentIndexConfig::default())
+    }
+
+    /// Index a document
+    pub fn index_document(
+        &self,
+        doc_id: DocumentId,
+        version: Version,
+        term_frequencies: HashMap<String, u32>,
+        doc_len: u32,
+        raft_index: RaftIndex,
+    ) -> io::Result<DocNo> {
+        let mut buffer = self.buffer.write().unwrap();
+        let docno = buffer.index_document(doc_id, version, term_frequencies, doc_len, None, raft_index);
+
+        // Check if we need to flush
+        if buffer.should_flush(&self.config.buffer) {
+            drop(buffer);
+            self.flush()?;
+        }
+
+        Ok(docno)
+    }
+
+    /// Delete a document
+    pub fn delete_document(&self, doc_id: DocumentId, raft_index: RaftIndex) -> bool {
+        let mut buffer = self.buffer.write().unwrap();
+        buffer.delete_document(doc_id, raft_index)
+        // Note: for documents in segments, we'd need to update the segment's delete bitset
+    }
+
+    /// Flush the buffer to a new segment
+    pub fn flush(&self) -> io::Result<Option<Arc<SegmentReader>>> {
+        let mut buffer = self.buffer.write().unwrap();
+
+        if buffer.doc_count() == 0 {
+            return Ok(None);
+        }
+
+        // Allocate segment ID
+        let segment_id = self.manifest.snapshot().next_segment_id;
+        self.manifest.update(|m| {
+            m.allocate_segment_id();
+        });
+
+        // Write segment
+        let writer = SegmentWriter::new(segment_id);
+        let result = writer.write_from_buffer(&buffer)?;
+
+        // Add to segments
+        let reader = Arc::new(result.reader);
+        {
+            let mut segments = self.segments.write().unwrap();
+            segments.push(reader.clone());
+        }
+
+        // Update manifest
+        self.manifest.update(|m| {
+            m.add_segment(reader.meta().clone());
+            if let Some(max_raft) = buffer.raft_index_range().1 {
+                m.update_index_applied(max_raft);
+            }
+        });
+
+        // Clear buffer
+        buffer.clear();
+
+        Ok(Some(reader))
+    }
+
+    /// Perform BM25+ keyword search
+    pub fn keyword_search(&self, query_terms: &[String], top_k: usize) -> io::Result<Vec<SearchResult>> {
+        if query_terms.is_empty() || top_k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Calculate global statistics
+        let (total_docs, global_avgdl) = self.compute_global_stats();
+
+        if total_docs == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Collect term document frequencies across all sources
+        let mut term_dfs: HashMap<String, u32> = HashMap::new();
+
+        // From buffer
+        {
+            let buffer = self.buffer.read().unwrap();
+            for term in query_terms {
+                let df = buffer.doc_frequency(term);
+                *term_dfs.entry(term.clone()).or_insert(0) += df;
+            }
+        }
+
+        // From segments
+        {
+            let segments = self.segments.read().unwrap();
+            for segment in segments.iter() {
+                for term in query_terms {
+                    let df = segment.doc_frequency(term);
+                    *term_dfs.entry(term.clone()).or_insert(0) += df;
+                }
+            }
+        }
+
+        // Score documents using a min-heap for top-k
+        let mut heap: BinaryHeap<SearchResult> = BinaryHeap::new();
+
+        // Score buffer documents
+        {
+            let buffer = self.buffer.read().unwrap();
+            let buffer_scores = buffer.search(query_terms, &self.config.bm25, total_docs);
+
+            for (docno, score) in buffer_scores {
+                if let Some(entry) = buffer.get_doc_entry(docno) {
+                    let result = SearchResult {
+                        doc_id: entry.doc_id,
+                        score,
+                        segment_id: None,
+                    };
+                    self.add_to_heap(&mut heap, result, top_k);
+                }
+            }
+        }
+
+        // Score segment documents
+        {
+            let segments = self.segments.read().unwrap();
+            for segment in segments.iter() {
+                let segment_scores = self.score_segment(segment, query_terms, &term_dfs, total_docs)?;
+
+                for (docno, score) in segment_scores {
+                    if let Some(doc_id) = segment.get_doc_id(docno) {
+                        let result = SearchResult {
+                            doc_id,
+                            score,
+                            segment_id: Some(segment.id()),
+                        };
+                        self.add_to_heap(&mut heap, result, top_k);
+                    }
+                }
+            }
+        }
+
+        // Convert heap to sorted results (already ordered highest score first due to reversed Ord)
+        let results: Vec<_> = heap.into_sorted_vec();
+        Ok(results)
+    }
+
+    /// Score documents in a segment
+    fn score_segment(
+        &self,
+        segment: &SegmentReader,
+        query_terms: &[String],
+        term_dfs: &HashMap<String, u32>,
+        total_docs: u32,
+    ) -> io::Result<Vec<(DocNo, f32)>> {
+        let mut scores: HashMap<DocNo, f32> = HashMap::new();
+
+        for term in query_terms {
+            let df = term_dfs.get(term).copied().unwrap_or(0);
+            if df == 0 {
+                continue;
+            }
+
+            if let Some(mut iter) = segment.get_postings(term)? {
+                while let Some((docno, tf)) = iter.next() {
+                    if segment.is_deleted(docno) {
+                        continue;
+                    }
+
+                    let score = segment.bm25_score(tf, df, total_docs, docno, &self.config.bm25);
+                    *scores.entry(docno).or_insert(0.0) += score;
+                }
+            }
+        }
+
+        Ok(scores.into_iter().collect())
+    }
+
+    /// Add result to top-k heap
+    fn add_to_heap(&self, heap: &mut BinaryHeap<SearchResult>, result: SearchResult, top_k: usize) {
+        if heap.len() < top_k {
+            heap.push(result);
+        } else if let Some(min) = heap.peek() {
+            // heap is min-heap due to reversed Ord
+            if result.score > min.score {
+                heap.pop();
+                heap.push(result);
+            }
+        }
+    }
+
+    /// Compute global statistics across buffer and segments
+    fn compute_global_stats(&self) -> (u32, f64) {
+        let mut total_docs = 0u32;
+        let mut total_length = 0u64;
+
+        // Buffer stats
+        {
+            let buffer = self.buffer.read().unwrap();
+            total_docs += buffer.live_doc_count();
+            total_length += buffer.stats().total_doc_length;
+        }
+
+        // Segment stats
+        {
+            let segments = self.segments.read().unwrap();
+            for segment in segments.iter() {
+                total_docs += segment.live_doc_count();
+                total_length += segment.stats().total_doc_length;
+            }
+        }
+
+        let avgdl = if total_docs > 0 {
+            total_length as f64 / total_docs as f64
+        } else {
+            0.0
+        };
+
+        (total_docs, avgdl)
+    }
+
+    /// Get total document count (including deleted)
+    pub fn total_doc_count(&self) -> u32 {
+        let buffer_count = self.buffer.read().unwrap().doc_count();
+        let segment_count: u32 = self
+            .segments
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| s.doc_count())
+            .sum();
+        buffer_count + segment_count
+    }
+
+    /// Get live document count (excluding deleted)
+    pub fn live_doc_count(&self) -> u32 {
+        let buffer_count = self.buffer.read().unwrap().live_doc_count();
+        let segment_count: u32 = self
+            .segments
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| s.live_doc_count())
+            .sum();
+        buffer_count + segment_count
+    }
+
+    /// Get segment count
+    pub fn segment_count(&self) -> usize {
+        self.segments.read().unwrap().len()
+    }
+
+    /// Get buffer document count
+    pub fn buffer_doc_count(&self) -> u32 {
+        self.buffer.read().unwrap().doc_count()
+    }
+
+    /// Get the manifest
+    pub fn manifest(&self) -> &ManifestHolder {
+        &self.manifest
+    }
+
+    /// Check if document exists
+    pub fn contains_document(&self, doc_id: DocumentId) -> bool {
+        // Check buffer
+        if self.buffer.read().unwrap().contains_document(doc_id) {
+            return true;
+        }
+
+        // Check segments
+        let segments = self.segments.read().unwrap();
+        for segment in segments.iter() {
+            // Search through the docno map for this document
+            for (docno, entry) in segment.docno_map().live_docs() {
+                if entry.doc_id == doc_id {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Get segments that could be merged
+    pub fn get_merge_candidates(&self) -> Vec<Arc<SegmentReader>> {
+        let segments = self.segments.read().unwrap();
+
+        // Simple policy: merge all segments if we have too many
+        if segments.len() > self.config.max_segments {
+            segments.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Apply a merge result
+    pub fn apply_merge(
+        &self,
+        merged_segment: Arc<SegmentReader>,
+        merged_ids: &[SegmentId],
+    ) -> io::Result<()> {
+        let mut segments = self.segments.write().unwrap();
+
+        // Remove old segments
+        segments.retain(|s| !merged_ids.contains(&s.id()));
+
+        // Add new segment
+        segments.push(merged_segment.clone());
+
+        // Update manifest
+        self.manifest.update(|m| {
+            for id in merged_ids {
+                m.remove_segment(*id);
+            }
+            m.add_segment(merged_segment.meta().clone());
+        });
+
+        Ok(())
+    }
+}
+
+impl Default for SegmentIndex {
+    fn default() -> Self {
+        Self::default_config()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_index_and_search() {
+        let index = SegmentIndex::default_config();
+
+        // Index documents
+        let mut tf1 = HashMap::new();
+        tf1.insert("rust".to_string(), 5);
+        tf1.insert("programming".to_string(), 3);
+        index.index_document(1, Version::new(1), tf1, 100, 1).unwrap();
+
+        let mut tf2 = HashMap::new();
+        tf2.insert("rust".to_string(), 2);
+        tf2.insert("language".to_string(), 4);
+        index.index_document(2, Version::new(1), tf2, 150, 2).unwrap();
+
+        let mut tf3 = HashMap::new();
+        tf3.insert("programming".to_string(), 1);
+        tf3.insert("language".to_string(), 2);
+        index.index_document(3, Version::new(1), tf3, 80, 3).unwrap();
+
+        // Search
+        let results = index
+            .keyword_search(&["rust".to_string()], 10)
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        // Doc 1 should rank higher (higher TF for "rust")
+        assert_eq!(results[0].doc_id, 1);
+        assert_eq!(results[1].doc_id, 2);
+    }
+
+    #[test]
+    fn test_multi_term_search() {
+        let index = SegmentIndex::default_config();
+
+        let mut tf1 = HashMap::new();
+        tf1.insert("rust".to_string(), 3);
+        tf1.insert("programming".to_string(), 2);
+        index.index_document(1, Version::new(1), tf1, 100, 1).unwrap();
+
+        let mut tf2 = HashMap::new();
+        tf2.insert("rust".to_string(), 1);
+        tf2.insert("programming".to_string(), 5);
+        index.index_document(2, Version::new(1), tf2, 100, 2).unwrap();
+
+        let results = index
+            .keyword_search(&["rust".to_string(), "programming".to_string()], 10)
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        // Both documents match both terms
+        assert!(results.iter().any(|r| r.doc_id == 1));
+        assert!(results.iter().any(|r| r.doc_id == 2));
+    }
+
+    #[test]
+    fn test_flush_to_segment() {
+        let config = SegmentIndexConfig {
+            buffer: BufferConfig {
+                max_docs: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let index = SegmentIndex::new(config);
+
+        // Index documents (should trigger flush after 2)
+        let mut tf1 = HashMap::new();
+        tf1.insert("test".to_string(), 1);
+        index.index_document(1, Version::new(1), tf1, 50, 1).unwrap();
+
+        assert_eq!(index.segment_count(), 0);
+        assert_eq!(index.buffer_doc_count(), 1);
+
+        let mut tf2 = HashMap::new();
+        tf2.insert("test".to_string(), 2);
+        index.index_document(2, Version::new(1), tf2, 75, 2).unwrap();
+
+        // Should have flushed
+        assert_eq!(index.segment_count(), 1);
+        assert_eq!(index.buffer_doc_count(), 0);
+
+        // Search should still work across segment
+        let results = index.keyword_search(&["test".to_string()], 10).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_document() {
+        let index = SegmentIndex::default_config();
+
+        let mut tf1 = HashMap::new();
+        tf1.insert("hello".to_string(), 1);
+        index.index_document(1, Version::new(1), tf1, 50, 1).unwrap();
+
+        let mut tf2 = HashMap::new();
+        tf2.insert("hello".to_string(), 1);
+        index.index_document(2, Version::new(1), tf2, 50, 2).unwrap();
+
+        // Both should be searchable
+        let results = index.keyword_search(&["hello".to_string()], 10).unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Delete one
+        index.delete_document(1, 3);
+
+        // Only one should be searchable now
+        let results = index.keyword_search(&["hello".to_string()], 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, 2);
+    }
+
+    #[test]
+    fn test_document_count() {
+        let index = SegmentIndex::default_config();
+
+        assert_eq!(index.total_doc_count(), 0);
+        assert_eq!(index.live_doc_count(), 0);
+
+        let mut tf1 = HashMap::new();
+        tf1.insert("test".to_string(), 1);
+        index.index_document(1, Version::new(1), tf1, 50, 1).unwrap();
+
+        assert_eq!(index.total_doc_count(), 1);
+        assert_eq!(index.live_doc_count(), 1);
+
+        index.delete_document(1, 2);
+
+        assert_eq!(index.total_doc_count(), 1);
+        assert_eq!(index.live_doc_count(), 0);
+    }
+}
