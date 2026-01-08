@@ -31,8 +31,10 @@ async fn test_single_node_operations() -> Result<(), Box<dyn std::error::Error>>
     let temp_dir = TempDir::new()?;
 
     let settings = create_test_settings();
-    let state_machine =
-        Arc::new(SearchStateMachine::new(settings, temp_dir.path().to_path_buf())?);
+    let state_machine = Arc::new(SearchStateMachine::new(
+        settings,
+        temp_dir.path().to_path_buf(),
+    )?);
 
     let config = NodeConfig::new(
         1,
@@ -72,8 +74,10 @@ async fn test_snapshot_and_restore() -> Result<(), Box<dyn std::error::Error>> {
 
     let temp_dir = TempDir::new()?;
     let settings = create_test_settings();
-    let state_machine =
-        Arc::new(SearchStateMachine::new(settings, temp_dir.path().to_path_buf())?);
+    let state_machine = Arc::new(SearchStateMachine::new(
+        settings,
+        temp_dir.path().to_path_buf(),
+    )?);
 
     // Index some documents
     for i in 1..=10 {
@@ -91,8 +95,10 @@ async fn test_snapshot_and_restore() -> Result<(), Box<dyn std::error::Error>> {
     // Create a new state machine and restore
     let temp_dir2 = TempDir::new()?;
     let settings2 = create_test_settings();
-    let state_machine2 =
-        Arc::new(SearchStateMachine::new(settings2, temp_dir2.path().to_path_buf())?);
+    let state_machine2 = Arc::new(SearchStateMachine::new(
+        settings2,
+        temp_dir2.path().to_path_buf(),
+    )?);
 
     state_machine2.restore_snapshot(&snapshot)?;
 
@@ -110,8 +116,10 @@ async fn test_snapshot_and_restore() -> Result<(), Box<dyn std::error::Error>> {
 async fn test_vector_and_hybrid_search() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
     let settings = create_test_settings();
-    let state_machine =
-        Arc::new(SearchStateMachine::new(settings, temp_dir.path().to_path_buf())?);
+    let state_machine = Arc::new(SearchStateMachine::new(
+        settings,
+        temp_dir.path().to_path_buf(),
+    )?);
 
     // Index documents with different embeddings
     let docs = vec![

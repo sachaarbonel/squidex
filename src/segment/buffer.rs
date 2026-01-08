@@ -6,7 +6,9 @@
 use std::collections::HashMap;
 
 use super::statistics::{Bm25Params, SegmentStatistics};
-use super::types::{DocNo, DocNoEntry, DocValueRow, DocumentId, Posting, RaftIndex, TermId, Version};
+use super::types::{
+    DocNo, DocNoEntry, DocValueRow, DocumentId, Posting, RaftIndex, TermId, Version,
+};
 
 /// Configuration for buffer flush triggers
 #[derive(Clone, Debug)]
@@ -154,7 +156,8 @@ impl MutableBuffer {
         for (term, positions) in term_positions {
             let tf = positions.len() as u32;
             let posting = Posting::with_positions(docno, tf, positions);
-            self.size_bytes += std::mem::size_of::<Posting>() + term.len() + posting.positions.len() * 4;
+            self.size_bytes +=
+                std::mem::size_of::<Posting>() + term.len() + posting.positions.len() * 4;
             self.terms
                 .entry(term)
                 .or_insert_with(Vec::new)
@@ -371,14 +374,7 @@ mod tests {
         term_freqs.insert("hello".to_string(), 2);
         term_freqs.insert("world".to_string(), 1);
 
-        let docno = buffer.index_document(
-            1,
-            Version::new(1),
-            term_freqs,
-            100,
-            None,
-            1,
-        );
+        let docno = buffer.index_document(1, Version::new(1), term_freqs, 100, None, 1);
 
         assert_eq!(docno, DocNo::new(0));
         assert_eq!(buffer.doc_count(), 1);

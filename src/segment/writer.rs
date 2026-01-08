@@ -7,9 +7,11 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+use crc32fast::Hasher;
+
 use super::buffer::MutableBuffer;
 use super::docno_map::DocNoMap;
-use super::docvalues::DocValuesReader;
+use super::docvalues::{BooleanColumn, DocValuesReader, KeywordColumn, NumericColumn};
 use super::postings::{PostingsReader, PostingsWriter};
 use super::reader::{SegmentMeta, SegmentReader};
 use super::statistics::SegmentStatistics;
@@ -30,6 +32,27 @@ pub struct SegmentWriteResult {
     pub docno_map_data: Vec<u8>,
     /// Statistics serialized
     pub stats_data: Vec<u8>,
+    /// DocValues serialized
+    pub docvalues_data: Vec<u8>,
+}
+
+impl SegmentWriteResult {
+    /// Compute a checksum over all persisted segment artifacts.
+    ///
+    /// Algorithm: crc32fast (CRC32).
+    /// Coverage: postings, term dictionary FST, term metadata (bincode), docno map, stats, docvalues.
+    /// The manifest checksum MUST match this value for both flush and merge paths.
+    pub fn checksum(&self) -> u64 {
+        let mut hasher = Hasher::new();
+        hasher.update(&self.postings_data);
+        hasher.update(&self.fst_data);
+        let term_meta_bytes = bincode::serialize(&self.term_metadata).unwrap_or_default();
+        hasher.update(&term_meta_bytes);
+        hasher.update(&self.docno_map_data);
+        hasher.update(&self.stats_data);
+        hasher.update(&self.docvalues_data);
+        hasher.finalize() as u64
+    }
 }
 
 /// Writer for creating new segments from a mutable buffer
@@ -70,7 +93,8 @@ impl SegmentWriter {
                 }
 
                 if doc_frequency > 0 {
-                    let meta = postings_writer.finish_posting_list(doc_frequency, total_term_frequency);
+                    let meta =
+                        postings_writer.finish_posting_list(doc_frequency, total_term_frequency);
                     term_builder.add(term.clone(), meta);
                     total_postings += doc_frequency as u64;
                 }
@@ -114,12 +138,16 @@ impl SegmentWriter {
         let stats_data = bincode::serialize(&stats)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        let docvalues =
+            DocValuesReader::from_rows(buffer.all_docvalues(), buffer.doc_count() as usize);
+        let docvalues_data = docvalues.serialize();
+
         // Create the segment reader
         let reader = SegmentReader::from_memory(
             meta,
             term_dict,
             PostingsReader::new(postings_data.clone()),
-            DocValuesReader::new(), // TODO: add docvalues support
+            docvalues,
             stats,
             docno_map,
         );
@@ -131,6 +159,7 @@ impl SegmentWriter {
             term_metadata,
             docno_map_data,
             stats_data,
+            docvalues_data,
         })
     }
 
@@ -244,11 +273,87 @@ impl SegmentWriter {
         let stats_data = bincode::serialize(&merged_stats)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        let merged_doc_count = merged_docno_map.len();
+        let mut doc_sources: Vec<Option<(usize, DocNo)>> = vec![None; merged_doc_count];
+        for (seg_idx, remap) in segment_docno_remaps.iter().enumerate() {
+            for (old_docno, &new_docno) in remap.iter() {
+                let idx = new_docno.as_usize();
+                if idx < doc_sources.len() {
+                    doc_sources[idx] = Some((seg_idx, *old_docno));
+                }
+            }
+        }
+
+        let mut merged_docvalues = DocValuesReader::new();
+
+        let mut numeric_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut boolean_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let mut keyword_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+
+        for segment in segments {
+            for name in segment.docvalues().numeric_columns().keys() {
+                numeric_names.insert(name.clone());
+            }
+            for name in segment.docvalues().boolean_columns().keys() {
+                boolean_names.insert(name.clone());
+            }
+            for name in segment.docvalues().keyword_columns().keys() {
+                keyword_names.insert(name.clone());
+            }
+        }
+
+        for name in numeric_names {
+            let mut column = NumericColumn::with_capacity(merged_doc_count);
+            for docno_idx in 0..merged_doc_count {
+                let value = doc_sources[docno_idx].and_then(|(seg_idx, old_docno)| {
+                    segments[seg_idx]
+                        .docvalues()
+                        .get_numeric(&name)
+                        .and_then(|c| c.get(old_docno))
+                });
+                column.add(value);
+            }
+            merged_docvalues.add_numeric(name, column);
+        }
+
+        for name in boolean_names {
+            let mut column = BooleanColumn::new();
+            for docno_idx in 0..merged_doc_count {
+                let value = doc_sources[docno_idx].and_then(|(seg_idx, old_docno)| {
+                    segments[seg_idx]
+                        .docvalues()
+                        .get_boolean(&name)
+                        .and_then(|c| c.get(old_docno))
+                });
+                column.add(value);
+            }
+            merged_docvalues.add_boolean(name, column);
+        }
+
+        for name in keyword_names {
+            let mut column = KeywordColumn::new();
+            for docno_idx in 0..merged_doc_count {
+                let value = doc_sources[docno_idx].and_then(|(seg_idx, old_docno)| {
+                    segments[seg_idx]
+                        .docvalues()
+                        .get_keyword(&name)
+                        .and_then(|c| c.get(old_docno))
+                });
+                column.add(value);
+            }
+            merged_docvalues.add_keyword(name, column);
+        }
+
+        let docvalues_data = merged_docvalues.serialize();
+
         let reader = SegmentReader::from_memory(
             meta,
             term_dict,
             PostingsReader::new(postings_data.clone()),
-            DocValuesReader::new(),
+            merged_docvalues,
             merged_stats,
             merged_docno_map,
         );
@@ -260,6 +365,7 @@ impl SegmentWriter {
             term_metadata,
             docno_map_data,
             stats_data,
+            docvalues_data,
         })
     }
 }
@@ -354,6 +460,39 @@ mod tests {
         assert!(!result.fst_data.is_empty());
         assert!(!result.docno_map_data.is_empty());
         assert!(!result.stats_data.is_empty());
+        assert!(!result.docvalues_data.is_empty());
+    }
+
+    #[test]
+    fn test_write_docvalues() {
+        let mut buffer = MutableBuffer::new();
+
+        let mut term_freqs = HashMap::new();
+        term_freqs.insert("hello".to_string(), 1);
+
+        let mut docvalues = super::super::types::DocValueRow::new();
+        docvalues.numerics = vec![Some(42)];
+        docvalues.booleans = vec![Some(true)];
+        docvalues.keywords = vec![Some("alpha".to_string())];
+
+        buffer.index_document(100, Version::new(1), term_freqs, 50, Some(docvalues), 1);
+
+        let writer = SegmentWriter::new(SegmentId::new(1));
+        let result = writer.write_from_buffer(&buffer).unwrap();
+
+        let dv = result.reader.docvalues();
+        assert_eq!(
+            dv.get_numeric("numeric_0").unwrap().get(DocNo::new(0)),
+            Some(42)
+        );
+        assert_eq!(
+            dv.get_boolean("boolean_0").unwrap().get(DocNo::new(0)),
+            Some(true)
+        );
+        assert_eq!(
+            dv.get_keyword("keyword_0").unwrap().get(DocNo::new(0)),
+            Some("alpha")
+        );
     }
 
     #[test]

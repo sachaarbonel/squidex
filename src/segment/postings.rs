@@ -194,7 +194,11 @@ impl PostingsWriter {
     }
 
     /// Finish writing a posting list and return metadata
-    pub fn finish_posting_list(&mut self, doc_frequency: u32, total_term_frequency: u64) -> PostingListMeta {
+    pub fn finish_posting_list(
+        &mut self,
+        doc_frequency: u32,
+        total_term_frequency: u64,
+    ) -> PostingListMeta {
         // Flush any remaining postings
         if !self.current_block.is_empty() {
             self.flush_block();
@@ -208,7 +212,8 @@ impl PostingsWriter {
         // Write skip entries (for efficient skip-to)
         for skip in &self.skip_entries {
             encode_vbyte(skip.max_docno.0, &mut self.data);
-            self.data.extend_from_slice(&skip.block_offset.to_le_bytes());
+            self.data
+                .extend_from_slice(&skip.block_offset.to_le_bytes());
             self.data.extend_from_slice(&skip.max_score.to_le_bytes());
         }
 
@@ -265,7 +270,8 @@ impl PostingsWriter {
         bitpack_encode(&self.current_block.term_frequencies, &mut self.block_data);
 
         // Write max_tf (for per-block WAND bounds)
-        self.block_data.extend_from_slice(&self.current_block.max_tf.to_le_bytes());
+        self.block_data
+            .extend_from_slice(&self.current_block.max_tf.to_le_bytes());
 
         // Clear block for next batch
         self.current_block = PostingBlock::new();
@@ -402,7 +408,8 @@ impl<'a> PostingIterator<'a> {
             self.current_block_idx += 1;
             if self.current_block_idx < self.skip_entries.len() {
                 // Jump to next block's position
-                self.pos = self.blocks_start + self.skip_entries[self.current_block_idx].block_offset as usize;
+                self.pos = self.blocks_start
+                    + self.skip_entries[self.current_block_idx].block_offset as usize;
                 self.last_docno = if self.current_block_idx > 0 {
                     self.skip_entries[self.current_block_idx - 1].max_docno.0
                 } else {

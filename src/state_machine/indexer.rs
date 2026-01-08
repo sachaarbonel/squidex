@@ -44,7 +44,8 @@ pub fn spawn_indexer(
                     let doc_len = tokenizer.tokenize(&doc.content).len() as u32;
                     // Version derived from updated_at for now
                     let version = Version::new(doc.updated_at);
-                    let _ = text_index.index_document(doc.id, version, term_freqs, doc_len, raft_index);
+                    let _ =
+                        text_index.index_document(doc.id, version, term_freqs, doc_len, raft_index);
 
                     // Vector indexing
                     {

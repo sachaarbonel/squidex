@@ -63,7 +63,12 @@ impl TermDictionary {
                 }
             } else if key > prefix_bytes && !key.starts_with(prefix_bytes) {
                 // We've passed the prefix range, can stop
-                if results.is_empty() || !results.last().map(|(t, _)| t.starts_with(prefix)).unwrap_or(false) {
+                if results.is_empty()
+                    || !results
+                        .last()
+                        .map(|(t, _)| t.starts_with(prefix))
+                        .unwrap_or(false)
+                {
                     continue; // Haven't found matching terms yet
                 }
                 break;

@@ -285,9 +285,7 @@ impl Default for SegmentReaderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::{
-        MutableBuffer, PostingsWriter, TermDictionaryBuilder, Version,
-    };
+    use crate::segment::{MutableBuffer, PostingsWriter, TermDictionaryBuilder, Version};
     use std::collections::HashMap;
 
     fn create_test_segment() -> SegmentReader {

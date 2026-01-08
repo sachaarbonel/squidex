@@ -73,20 +73,21 @@ impl SearchSnapshot {
     pub fn estimated_size(&self) -> usize {
         // Rough estimation for monitoring
         let vector_store = &self.hnsw_index.vector_store;
-        let quantized_size =
-            vector_store.quantized_vectors.len() * vector_store.num_subspaces;
+        let quantized_size = vector_store.quantized_vectors.len() * vector_store.num_subspaces;
         let codebook_size = vector_store.num_subspaces
             * 256
             * (vector_store.dimensions / vector_store.num_subspaces)
             * 4;
-        let buffer_size =
-            vector_store.training_buffer.len() * vector_store.dimensions * 4;
+        let buffer_size = vector_store.training_buffer.len() * vector_store.dimensions * 4;
         let graph_size = self.hnsw_index.layers.len() * 1000; // Approximate per-layer
 
         std::mem::size_of::<Self>()
             + self.documents.len() * 1000
             + self.inverted_index.len() * 100
-            + quantized_size + codebook_size + buffer_size + graph_size
+            + quantized_size
+            + codebook_size
+            + buffer_size
+            + graph_size
     }
 }
 

@@ -10,30 +10,30 @@
 //! - `SegmentIndex`: Combines mutable buffer + immutable segments
 //! - `SegmentManifest`: Tracks live segments with atomic updates
 
-mod types;
-mod statistics;
 mod buffer;
-mod postings;
-mod term_dict;
-mod docvalues;
 mod docno_map;
-mod reader;
-mod writer;
-mod manifest;
+mod docvalues;
 mod index;
+mod manifest;
 mod merge;
+mod postings;
+mod reader;
+mod statistics;
 mod store;
+mod term_dict;
+mod types;
+mod writer;
 
-pub use types::*;
-pub use statistics::*;
 pub use buffer::*;
-pub use postings::*;
-pub use term_dict::*;
-pub use docvalues::*;
 pub use docno_map::*;
-pub use reader::*;
-pub use writer::*;
-pub use manifest::*;
+pub use docvalues::*;
 pub use index::*;
+pub use manifest::*;
 pub use merge::*;
+pub use postings::*;
+pub use reader::*;
+pub use statistics::*;
 pub use store::*;
+pub use term_dict::*;
+pub use types::*;
+pub use writer::*;

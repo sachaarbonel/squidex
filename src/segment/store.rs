@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::segment::docvalues::DocValuesReader;
 use crate::segment::manifest::SegmentManifest;
 use crate::segment::reader::{SegmentMeta, SegmentReader, SegmentReaderBuilder};
 use crate::segment::writer::SegmentWriteResult;
@@ -39,6 +40,7 @@ impl SegmentStore {
         )?;
         fs::write(dir.join("docno_map.bin"), &result.docno_map_data)?;
         fs::write(dir.join("stats.bin"), &result.stats_data)?;
+        fs::write(dir.join("docvalues.bin"), &result.docvalues_data)?;
         Ok(())
     }
 
@@ -52,9 +54,15 @@ impl SegmentStore {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let docno_map = fs::read(dir.join("docno_map.bin"))?;
         let stats_bytes = fs::read(dir.join("stats.bin"))?;
+        let docvalues_bytes = fs::read(dir.join("docvalues.bin")).unwrap_or_default();
         let stats: crate::segment::statistics::SegmentStatistics =
             bincode::deserialize(&stats_bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let docvalues = if docvalues_bytes.is_empty() {
+            DocValuesReader::new()
+        } else {
+            DocValuesReader::deserialize(&docvalues_bytes)?
+        };
 
         let builder = SegmentReaderBuilder::new()
             .with_meta(meta)
@@ -64,7 +72,8 @@ impl SegmentStore {
                 crate::segment::docno_map::DocNoMap::deserialize(&docno_map)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
             )
-            .with_stats(stats);
+            .with_stats(stats)
+            .with_docvalues(docvalues);
 
         Ok(Arc::new(builder.build()?))
     }

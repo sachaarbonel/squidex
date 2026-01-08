@@ -7,13 +7,13 @@
 //! - nulls: explicit bitmap
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
+use std::io;
 
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 use super::postings::{bitpack_decode, bitpack_encode, decode_vbyte, encode_vbyte};
-use super::types::DocNo;
+use super::types::{DocNo, DocValueRow};
 
 /// Column types for doc values
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -510,6 +510,80 @@ impl DocValuesReader {
         }
     }
 
+    /// Build docvalues from row-oriented data.
+    pub fn from_rows(rows: &HashMap<DocNo, DocValueRow>, doc_count: usize) -> Self {
+        if rows.is_empty() || doc_count == 0 {
+            return Self::new();
+        }
+
+        let mut max_numeric = 0usize;
+        let mut max_boolean = 0usize;
+        let mut max_keyword = 0usize;
+
+        for row in rows.values() {
+            max_numeric = max_numeric.max(row.numerics.len());
+            max_boolean = max_boolean.max(row.booleans.len());
+            max_keyword = max_keyword.max(row.keywords.len());
+        }
+
+        let mut numeric_columns = Vec::with_capacity(max_numeric);
+        for _ in 0..max_numeric {
+            numeric_columns.push(NumericColumn::with_capacity(doc_count));
+        }
+
+        let mut boolean_columns = Vec::with_capacity(max_boolean);
+        for _ in 0..max_boolean {
+            boolean_columns.push(BooleanColumn::new());
+        }
+
+        let mut keyword_columns = Vec::with_capacity(max_keyword);
+        for _ in 0..max_keyword {
+            keyword_columns.push(KeywordColumn::new());
+        }
+
+        for docno_idx in 0..doc_count {
+            let docno = DocNo::new(docno_idx as u32);
+            let row = rows.get(&docno);
+
+            for (idx, column) in numeric_columns.iter_mut().enumerate() {
+                let value = row
+                    .and_then(|r| r.numerics.get(idx).cloned())
+                    .unwrap_or(None);
+                column.add(value);
+            }
+
+            for (idx, column) in boolean_columns.iter_mut().enumerate() {
+                let value = row
+                    .and_then(|r| r.booleans.get(idx).cloned())
+                    .unwrap_or(None);
+                column.add(value);
+            }
+
+            for (idx, column) in keyword_columns.iter_mut().enumerate() {
+                let value = row
+                    .and_then(|r| r.keywords.get(idx).cloned())
+                    .unwrap_or(None);
+                match value.as_deref() {
+                    Some(keyword) => column.add(Some(keyword)),
+                    None => column.add(None),
+                }
+            }
+        }
+
+        let mut reader = Self::new();
+        for (idx, column) in numeric_columns.into_iter().enumerate() {
+            reader.add_numeric(format!("numeric_{}", idx), column);
+        }
+        for (idx, column) in boolean_columns.into_iter().enumerate() {
+            reader.add_boolean(format!("boolean_{}", idx), column);
+        }
+        for (idx, column) in keyword_columns.into_iter().enumerate() {
+            reader.add_keyword(format!("keyword_{}", idx), column);
+        }
+
+        reader
+    }
+
     pub fn add_numeric(&mut self, name: String, column: NumericColumn) {
         self.numeric_columns.insert(name, column);
     }
@@ -532,6 +606,128 @@ impl DocValuesReader {
 
     pub fn get_keyword(&self, name: &str) -> Option<&KeywordColumn> {
         self.keyword_columns.get(name)
+    }
+
+    pub fn numeric_columns(&self) -> &HashMap<String, NumericColumn> {
+        &self.numeric_columns
+    }
+
+    pub fn boolean_columns(&self) -> &HashMap<String, BooleanColumn> {
+        &self.boolean_columns
+    }
+
+    pub fn keyword_columns(&self) -> &HashMap<String, KeywordColumn> {
+        &self.keyword_columns
+    }
+
+    /// Serialize all columns into a single byte stream.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut output = Vec::new();
+
+        let total_columns =
+            self.numeric_columns.len() + self.boolean_columns.len() + self.keyword_columns.len();
+        encode_vbyte(total_columns as u32, &mut output);
+
+        let mut numeric_names: Vec<_> = self.numeric_columns.keys().collect();
+        numeric_names.sort();
+        for name in numeric_names {
+            let column = &self.numeric_columns[name];
+            output.push(ColumnType::Numeric as u8);
+            encode_vbyte(name.len() as u32, &mut output);
+            output.extend(name.as_bytes());
+            let data = column.serialize();
+            encode_vbyte(data.len() as u32, &mut output);
+            output.extend(data);
+        }
+
+        let mut boolean_names: Vec<_> = self.boolean_columns.keys().collect();
+        boolean_names.sort();
+        for name in boolean_names {
+            let column = &self.boolean_columns[name];
+            output.push(ColumnType::Boolean as u8);
+            encode_vbyte(name.len() as u32, &mut output);
+            output.extend(name.as_bytes());
+            let data = column.serialize();
+            encode_vbyte(data.len() as u32, &mut output);
+            output.extend(data);
+        }
+
+        let mut keyword_names: Vec<_> = self.keyword_columns.keys().collect();
+        keyword_names.sort();
+        for name in keyword_names {
+            let column = &self.keyword_columns[name];
+            output.push(ColumnType::Keyword as u8);
+            encode_vbyte(name.len() as u32, &mut output);
+            output.extend(name.as_bytes());
+            let data = column.serialize();
+            encode_vbyte(data.len() as u32, &mut output);
+            output.extend(data);
+        }
+
+        output
+    }
+
+    /// Deserialize columns from a byte stream.
+    pub fn deserialize(data: &[u8]) -> io::Result<Self> {
+        if data.is_empty() {
+            return Ok(Self::new());
+        }
+
+        let mut pos = 0;
+        let column_count = decode_vbyte(data, &mut pos)? as usize;
+        let mut reader = Self::new();
+
+        for _ in 0..column_count {
+            let col_type = data.get(pos).copied().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Missing column type")
+            })?;
+            pos += 1;
+
+            let name_len = decode_vbyte(data, &mut pos)? as usize;
+            if pos + name_len > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Truncated column name",
+                ));
+            }
+            let name = std::str::from_utf8(&data[pos..pos + name_len])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                .to_string();
+            pos += name_len;
+
+            let data_len = decode_vbyte(data, &mut pos)? as usize;
+            if pos + data_len > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Truncated column data",
+                ));
+            }
+            let column_data = &data[pos..pos + data_len];
+            pos += data_len;
+
+            match col_type {
+                x if x == ColumnType::Numeric as u8 => {
+                    let column = NumericColumn::deserialize(column_data)?;
+                    reader.add_numeric(name, column);
+                }
+                x if x == ColumnType::Boolean as u8 => {
+                    let column = BooleanColumn::deserialize(column_data)?;
+                    reader.add_boolean(name, column);
+                }
+                x if x == ColumnType::Keyword as u8 => {
+                    let column = KeywordColumn::deserialize(column_data)?;
+                    reader.add_keyword(name, column);
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unknown column type",
+                    ))
+                }
+            }
+        }
+
+        Ok(reader)
     }
 }
 
@@ -654,5 +850,55 @@ mod tests {
         assert_eq!(restored.get(DocNo(1)), Some("banana"));
         assert_eq!(restored.get(DocNo(2)), None);
         assert_eq!(restored.get(DocNo(3)), Some("apple"));
+    }
+
+    #[test]
+    fn test_docvalues_reader_from_rows_and_serialization() {
+        use std::collections::HashMap;
+
+        let mut rows: HashMap<DocNo, DocValueRow> = HashMap::new();
+
+        let mut row0 = DocValueRow::new();
+        row0.numerics = vec![Some(10), None];
+        row0.booleans = vec![Some(true)];
+        row0.keywords = vec![Some("alpha".to_string()), None];
+        rows.insert(DocNo(0), row0);
+
+        let mut row1 = DocValueRow::new();
+        row1.numerics = vec![Some(20)];
+        row1.booleans = vec![None];
+        row1.keywords = vec![Some("beta".to_string()), Some("gamma".to_string())];
+        rows.insert(DocNo(1), row1);
+
+        let reader = DocValuesReader::from_rows(&rows, 2);
+
+        let num0 = reader.get_numeric("numeric_0").unwrap();
+        let num1 = reader.get_numeric("numeric_1").unwrap();
+        assert_eq!(num0.get(DocNo(0)), Some(10));
+        assert_eq!(num0.get(DocNo(1)), Some(20));
+        assert_eq!(num1.get(DocNo(0)), None);
+        assert_eq!(num1.get(DocNo(1)), None);
+
+        let bool0 = reader.get_boolean("boolean_0").unwrap();
+        assert_eq!(bool0.get(DocNo(0)), Some(true));
+        assert_eq!(bool0.get(DocNo(1)), None);
+
+        let kw0 = reader.get_keyword("keyword_0").unwrap();
+        let kw1 = reader.get_keyword("keyword_1").unwrap();
+        assert_eq!(kw0.get(DocNo(0)), Some("alpha"));
+        assert_eq!(kw0.get(DocNo(1)), Some("beta"));
+        assert_eq!(kw1.get(DocNo(0)), None);
+        assert_eq!(kw1.get(DocNo(1)), Some("gamma"));
+
+        let data = reader.serialize();
+        let restored = DocValuesReader::deserialize(&data).unwrap();
+        assert_eq!(
+            restored.get_numeric("numeric_0").unwrap().get(DocNo(0)),
+            Some(10)
+        );
+        assert_eq!(
+            restored.get_keyword("keyword_1").unwrap().get(DocNo(1)),
+            Some("gamma")
+        );
     }
 }

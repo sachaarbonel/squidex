@@ -3,8 +3,8 @@
 //! SegmentIndex = mutable buffer + immutable segments
 //! Provides BM25+ scoring across buffer + segments
 
-use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::io;
 use std::sync::{Arc, RwLock};
 
@@ -108,9 +108,14 @@ impl SegmentIndex {
     }
 
     /// Open with a persistent store directory
-    pub fn open_with_store(config: SegmentIndexConfig, dir: std::path::PathBuf) -> io::Result<Self> {
+    pub fn open_with_store(
+        config: SegmentIndexConfig,
+        dir: std::path::PathBuf,
+    ) -> io::Result<Self> {
         let store = SegmentStore::new(dir)?;
-        let manifest = store.load_manifest().unwrap_or_else(|_| SegmentManifest::new());
+        let manifest = store
+            .load_manifest()
+            .unwrap_or_else(|_| SegmentManifest::new());
         let mut index = Self {
             buffer: RwLock::new(MutableBuffer::new()),
             segments: RwLock::new(Vec::new()),
@@ -142,7 +147,8 @@ impl SegmentIndex {
         raft_index: RaftIndex,
     ) -> io::Result<DocNo> {
         let mut buffer = self.buffer.write().unwrap();
-        let docno = buffer.index_document(doc_id, version, term_frequencies, doc_len, None, raft_index);
+        let docno =
+            buffer.index_document(doc_id, version, term_frequencies, doc_len, None, raft_index);
 
         // Check if we need to flush
         if buffer.should_flush(&self.config.buffer) {
@@ -177,6 +183,7 @@ impl SegmentIndex {
         // Write segment
         let writer = SegmentWriter::new(segment_id);
         let result = writer.write_from_buffer(&buffer)?;
+        let checksum = result.checksum();
 
         // Persist segment if store is configured
         if let Some(store) = &self.store {
@@ -192,7 +199,7 @@ impl SegmentIndex {
 
         // Update manifest
         self.manifest.update(|m| {
-            m.add_segment(reader.meta().clone());
+            m.add_segment_with_checksum(reader.meta().clone(), checksum);
             if let Some(max_raft) = buffer.raft_index_range().1 {
                 m.update_index_applied(max_raft);
             }
@@ -211,7 +218,11 @@ impl SegmentIndex {
     }
 
     /// Perform BM25+ keyword search
-    pub fn keyword_search(&self, query_terms: &[String], top_k: usize) -> io::Result<Vec<SearchResult>> {
+    pub fn keyword_search(
+        &self,
+        query_terms: &[String],
+        top_k: usize,
+    ) -> io::Result<Vec<SearchResult>> {
         if query_terms.is_empty() || top_k == 0 {
             return Ok(Vec::new());
         }
@@ -270,7 +281,8 @@ impl SegmentIndex {
         {
             let segments = self.segments.read().unwrap();
             for segment in segments.iter() {
-                let segment_scores = self.score_segment(segment, query_terms, &term_dfs, total_docs)?;
+                let segment_scores =
+                    self.score_segment(segment, query_terms, &term_dfs, total_docs)?;
 
                 for (docno, score) in segment_scores {
                     if let Some(doc_id) = segment.get_doc_id(docno) {
@@ -438,12 +450,19 @@ impl SegmentIndex {
         }
     }
 
-    /// Apply a merge result
+    /// Apply a merge result.
     pub fn apply_merge(
         &self,
-        merged_segment: Arc<SegmentReader>,
+        merged_result: super::writer::SegmentWriteResult,
         merged_ids: &[SegmentId],
     ) -> io::Result<()> {
+        let checksum = merged_result.checksum();
+
+        if let Some(store) = &self.store {
+            store.write_segment(&merged_result)?;
+        }
+
+        let merged_segment = Arc::new(merged_result.reader);
         let mut segments = self.segments.write().unwrap();
 
         // Remove old segments
@@ -457,7 +476,7 @@ impl SegmentIndex {
             for id in merged_ids {
                 m.remove_segment(*id);
             }
-            m.add_segment(merged_segment.meta().clone());
+            m.add_segment_with_checksum(merged_segment.meta().clone(), checksum);
         });
 
         if let Some(store) = &self.store {
@@ -487,22 +506,26 @@ mod tests {
         let mut tf1 = HashMap::new();
         tf1.insert("rust".to_string(), 5);
         tf1.insert("programming".to_string(), 3);
-        index.index_document(1, Version::new(1), tf1, 100, 1).unwrap();
+        index
+            .index_document(1, Version::new(1), tf1, 100, 1)
+            .unwrap();
 
         let mut tf2 = HashMap::new();
         tf2.insert("rust".to_string(), 2);
         tf2.insert("language".to_string(), 4);
-        index.index_document(2, Version::new(1), tf2, 150, 2).unwrap();
+        index
+            .index_document(2, Version::new(1), tf2, 150, 2)
+            .unwrap();
 
         let mut tf3 = HashMap::new();
         tf3.insert("programming".to_string(), 1);
         tf3.insert("language".to_string(), 2);
-        index.index_document(3, Version::new(1), tf3, 80, 3).unwrap();
+        index
+            .index_document(3, Version::new(1), tf3, 80, 3)
+            .unwrap();
 
         // Search
-        let results = index
-            .keyword_search(&["rust".to_string()], 10)
-            .unwrap();
+        let results = index.keyword_search(&["rust".to_string()], 10).unwrap();
 
         assert_eq!(results.len(), 2);
         // Doc 1 should rank higher (higher TF for "rust")
@@ -517,12 +540,16 @@ mod tests {
         let mut tf1 = HashMap::new();
         tf1.insert("rust".to_string(), 3);
         tf1.insert("programming".to_string(), 2);
-        index.index_document(1, Version::new(1), tf1, 100, 1).unwrap();
+        index
+            .index_document(1, Version::new(1), tf1, 100, 1)
+            .unwrap();
 
         let mut tf2 = HashMap::new();
         tf2.insert("rust".to_string(), 1);
         tf2.insert("programming".to_string(), 5);
-        index.index_document(2, Version::new(1), tf2, 100, 2).unwrap();
+        index
+            .index_document(2, Version::new(1), tf2, 100, 2)
+            .unwrap();
 
         let results = index
             .keyword_search(&["rust".to_string(), "programming".to_string()], 10)
@@ -548,14 +575,18 @@ mod tests {
         // Index documents (should trigger flush after 2)
         let mut tf1 = HashMap::new();
         tf1.insert("test".to_string(), 1);
-        index.index_document(1, Version::new(1), tf1, 50, 1).unwrap();
+        index
+            .index_document(1, Version::new(1), tf1, 50, 1)
+            .unwrap();
 
         assert_eq!(index.segment_count(), 0);
         assert_eq!(index.buffer_doc_count(), 1);
 
         let mut tf2 = HashMap::new();
         tf2.insert("test".to_string(), 2);
-        index.index_document(2, Version::new(1), tf2, 75, 2).unwrap();
+        index
+            .index_document(2, Version::new(1), tf2, 75, 2)
+            .unwrap();
 
         // Should have flushed
         assert_eq!(index.segment_count(), 1);
@@ -572,11 +603,15 @@ mod tests {
 
         let mut tf1 = HashMap::new();
         tf1.insert("hello".to_string(), 1);
-        index.index_document(1, Version::new(1), tf1, 50, 1).unwrap();
+        index
+            .index_document(1, Version::new(1), tf1, 50, 1)
+            .unwrap();
 
         let mut tf2 = HashMap::new();
         tf2.insert("hello".to_string(), 1);
-        index.index_document(2, Version::new(1), tf2, 50, 2).unwrap();
+        index
+            .index_document(2, Version::new(1), tf2, 50, 2)
+            .unwrap();
 
         // Both should be searchable
         let results = index.keyword_search(&["hello".to_string()], 10).unwrap();
@@ -600,7 +635,9 @@ mod tests {
 
         let mut tf1 = HashMap::new();
         tf1.insert("test".to_string(), 1);
-        index.index_document(1, Version::new(1), tf1, 50, 1).unwrap();
+        index
+            .index_document(1, Version::new(1), tf1, 50, 1)
+            .unwrap();
 
         assert_eq!(index.total_doc_count(), 1);
         assert_eq!(index.live_doc_count(), 1);

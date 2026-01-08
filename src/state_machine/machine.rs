@@ -724,8 +724,7 @@ mod tests {
         assert!(!snapshot.is_empty());
 
         let tmp2 = TempDir::new().unwrap();
-        let machine2 =
-            SearchStateMachine::new(settings, tmp2.path().to_path_buf()).unwrap();
+        let machine2 = SearchStateMachine::new(settings, tmp2.path().to_path_buf()).unwrap();
         machine2.restore_snapshot(&snapshot).unwrap();
 
         assert_eq!(machine2.total_documents(), 3);

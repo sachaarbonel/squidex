@@ -62,7 +62,8 @@ impl BlobLog {
         hasher.update(payload);
         let crc32 = hasher.finalize();
 
-        file.write_all(&len.to_le_bytes()).map_err(SquidexError::Io)?;
+        file.write_all(&len.to_le_bytes())
+            .map_err(SquidexError::Io)?;
         file.write_all(&crc32.to_le_bytes())
             .map_err(SquidexError::Io)?;
         file.write_all(payload).map_err(SquidexError::Io)?;

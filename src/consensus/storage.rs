@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{LogEntry, NodeId, Response, SquidexSnapshot, TypeConfig};
 use crate::error::SquidexError;
-use crate::state_machine::SearchStateMachine;
 use crate::models::Command;
+use crate::state_machine::SearchStateMachine;
 
 /// State machine state for persistence
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

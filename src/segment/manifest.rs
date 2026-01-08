@@ -21,7 +21,7 @@ use super::types::{RaftIndex, SegmentId};
 pub struct ManifestEntry {
     /// Segment metadata
     pub meta: SegmentMeta,
-    /// Checksum of segment files
+    /// Checksum of segment files (from SegmentWriteResult::checksum)
     pub checksum: u64,
 }
 
@@ -65,12 +65,9 @@ impl SegmentManifest {
         id
     }
 
-    /// Add a new segment to the manifest
-    pub fn add_segment(&mut self, meta: SegmentMeta) {
-        let entry = ManifestEntry {
-            meta,
-            checksum: 0, // TODO: compute checksum
-        };
+    /// Add a new segment to the manifest with an explicit checksum.
+    pub fn add_segment_with_checksum(&mut self, meta: SegmentMeta, checksum: u64) {
+        let entry = ManifestEntry { meta, checksum };
         self.segments.push(entry);
         self.generation += 1;
         self.updated_at = current_timestamp();
@@ -102,7 +99,10 @@ impl SegmentManifest {
 
     /// Get total live document count across all segments
     pub fn total_live_doc_count(&self) -> u64 {
-        self.segments.iter().map(|e| e.meta.live_doc_count as u64).sum()
+        self.segments
+            .iter()
+            .map(|e| e.meta.live_doc_count as u64)
+            .sum()
     }
 
     /// Get total size in bytes
@@ -132,26 +132,22 @@ impl SegmentManifest {
 
     /// Serialize the manifest to JSON
     pub fn to_json(&self) -> io::Result<Vec<u8>> {
-        serde_json::to_vec_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        serde_json::to_vec_pretty(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Deserialize manifest from JSON
     pub fn from_json(data: &[u8]) -> io::Result<Self> {
-        serde_json::from_slice(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        serde_json::from_slice(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Serialize the manifest to bincode (more compact)
     pub fn to_bincode(&self) -> io::Result<Vec<u8>> {
-        bincode::serialize(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        bincode::serialize(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     /// Deserialize manifest from bincode
     pub fn from_bincode(data: &[u8]) -> io::Result<Self> {
-        bincode::deserialize(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        bincode::deserialize(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -290,12 +286,15 @@ mod tests {
             created_at: current_timestamp(),
         };
 
-        manifest.add_segment(meta);
+        let expected_checksum = 42;
+
+        manifest.add_segment_with_checksum(meta, expected_checksum);
 
         assert_eq!(manifest.segment_count(), 1);
         assert!(!manifest.is_empty());
         assert_eq!(manifest.total_doc_count(), 1000);
         assert_eq!(manifest.total_live_doc_count(), 950);
+        assert_eq!(manifest.segments[0].checksum, expected_checksum);
     }
 
     #[test]
@@ -303,15 +302,18 @@ mod tests {
         let mut manifest = SegmentManifest::new();
 
         let id = manifest.allocate_segment_id();
-        manifest.add_segment(SegmentMeta {
-            id,
-            min_raft_index: 1,
-            max_raft_index: 100,
-            doc_count: 1000,
-            live_doc_count: 950,
-            size_bytes: 1024 * 1024,
-            created_at: 0,
-        });
+        manifest.add_segment_with_checksum(
+            SegmentMeta {
+                id,
+                min_raft_index: 1,
+                max_raft_index: 100,
+                doc_count: 1000,
+                live_doc_count: 950,
+                size_bytes: 1024 * 1024,
+                created_at: 0,
+            },
+            1,
+        );
 
         // Test JSON serialization
         let json = manifest.to_json().unwrap();
@@ -333,25 +335,31 @@ mod tests {
         let id1 = manifest.allocate_segment_id();
         let id2 = manifest.allocate_segment_id();
 
-        manifest.add_segment(SegmentMeta {
-            id: id1,
-            min_raft_index: 1,
-            max_raft_index: 50,
-            doc_count: 500,
-            live_doc_count: 500,
-            size_bytes: 512 * 1024,
-            created_at: 0,
-        });
+        manifest.add_segment_with_checksum(
+            SegmentMeta {
+                id: id1,
+                min_raft_index: 1,
+                max_raft_index: 50,
+                doc_count: 500,
+                live_doc_count: 500,
+                size_bytes: 512 * 1024,
+                created_at: 0,
+            },
+            1,
+        );
 
-        manifest.add_segment(SegmentMeta {
-            id: id2,
-            min_raft_index: 51,
-            max_raft_index: 100,
-            doc_count: 500,
-            live_doc_count: 500,
-            size_bytes: 512 * 1024,
-            created_at: 0,
-        });
+        manifest.add_segment_with_checksum(
+            SegmentMeta {
+                id: id2,
+                min_raft_index: 51,
+                max_raft_index: 100,
+                doc_count: 500,
+                live_doc_count: 500,
+                size_bytes: 512 * 1024,
+                created_at: 0,
+            },
+            2,
+        );
 
         assert_eq!(manifest.segment_count(), 2);
 
@@ -371,15 +379,18 @@ mod tests {
 
         holder.update(|m| {
             let id = m.allocate_segment_id();
-            m.add_segment(SegmentMeta {
-                id,
-                min_raft_index: 1,
-                max_raft_index: 100,
-                doc_count: 1000,
-                live_doc_count: 1000,
-                size_bytes: 1024,
-                created_at: 0,
-            });
+            m.add_segment_with_checksum(
+                SegmentMeta {
+                    id,
+                    min_raft_index: 1,
+                    max_raft_index: 100,
+                    doc_count: 1000,
+                    live_doc_count: 1000,
+                    size_bytes: 1024,
+                    created_at: 0,
+                },
+                1,
+            );
         });
 
         assert_eq!(holder.generation(), 1);

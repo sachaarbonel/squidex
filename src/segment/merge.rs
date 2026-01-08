@@ -153,10 +153,7 @@ impl TieredMergePolicy {
                 let mut sorted_segments = tier_segments.clone();
                 sorted_segments.sort_by_key(|s| s.meta().size_bytes);
 
-                let to_merge: Vec<_> = sorted_segments
-                    .into_iter()
-                    .take(merge_count)
-                    .collect();
+                let to_merge: Vec<_> = sorted_segments.into_iter().take(merge_count).collect();
 
                 if to_merge.len() >= self.config.min_merge_count {
                     let segment_ids: Vec<_> = to_merge.iter().map(|s| s.id()).collect();
@@ -235,8 +232,8 @@ impl TieredMergePolicy {
         }
 
         let total_size: u64 = segments.iter().map(|s| s.meta().size_bytes).sum();
-        let avg_delete_ratio: f64 = segments.iter().map(|s| s.delete_ratio()).sum::<f64>()
-            / segments.len() as f64;
+        let avg_delete_ratio: f64 =
+            segments.iter().map(|s| s.delete_ratio()).sum::<f64>() / segments.len() as f64;
 
         // Score components:
         // 1. Delete ratio (0-100 points)
@@ -284,9 +281,10 @@ impl MergeScheduler {
     pub fn add_candidates(&mut self, candidates: Vec<MergeCandidate>) {
         for candidate in candidates {
             // Don't add if any segment is already being merged
-            let overlaps = self.running.iter().any(|running| {
-                candidate.segment_ids.iter().any(|id| running.contains(id))
-            });
+            let overlaps = self
+                .running
+                .iter()
+                .any(|running| candidate.segment_ids.iter().any(|id| running.contains(id)));
 
             if !overlaps {
                 self.pending.push(candidate);
@@ -309,9 +307,10 @@ impl MergeScheduler {
 
         // Find first candidate that doesn't overlap with running merges
         let idx = self.pending.iter().position(|candidate| {
-            !self.running.iter().any(|running| {
-                candidate.segment_ids.iter().any(|id| running.contains(id))
-            })
+            !self
+                .running
+                .iter()
+                .any(|running| candidate.segment_ids.iter().any(|id| running.contains(id)))
         })?;
 
         let candidate = self.pending.remove(idx);

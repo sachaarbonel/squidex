@@ -4,11 +4,11 @@ pub mod consensus;
 pub mod error;
 pub mod metrics;
 pub mod models;
+pub mod persistence;
 pub mod segment;
 pub mod state_machine;
 pub mod tokenizer;
 pub mod vector;
-pub mod persistence;
 
 pub use api::{create_router, AppState};
 pub use config::{

@@ -398,7 +398,8 @@ impl HnswIndex {
 
         let mut visited: HashSet<DocumentId> = HashSet::new();
         // Min-heap for candidates (closest first)
-        let mut candidates: BinaryHeap<Reverse<(OrderedFloat<f32>, DocumentId)>> = BinaryHeap::new();
+        let mut candidates: BinaryHeap<Reverse<(OrderedFloat<f32>, DocumentId)>> =
+            BinaryHeap::new();
         // Max-heap for results (furthest first for easy pruning)
         let mut results: BinaryHeap<(OrderedFloat<f32>, DocumentId)> = BinaryHeap::new();
 
@@ -451,10 +452,8 @@ impl HnswIndex {
         }
 
         // Convert to sorted vec (ascending distance)
-        let mut result_vec: Vec<(DocumentId, f32)> = results
-            .into_iter()
-            .map(|(d, id)| (id, d.0))
-            .collect();
+        let mut result_vec: Vec<(DocumentId, f32)> =
+            results.into_iter().map(|(d, id)| (id, d.0)).collect();
         result_vec.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(result_vec)
@@ -543,7 +542,12 @@ impl HnswIndex {
     /// Search with custom ef_search (for adaptive filtering)
     ///
     /// ef = min(max_ef, base_ef + α * log2(filtered_count + 1))
-    pub fn search_with_ef(&self, query: &[f32], k: usize, ef_search: usize) -> Result<Vec<(DocumentId, f32)>> {
+    pub fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<(DocumentId, f32)>> {
         if self.entry_point.is_none() {
             return Ok(Vec::new());
         }
@@ -616,7 +620,8 @@ impl HnswIndex {
     /// Create a snapshot for persistence
     pub fn create_snapshot(&self) -> HnswSnapshot {
         // Serialize layers
-        let layers_data: Vec<LayerSnapshot> = self.layers
+        let layers_data: Vec<LayerSnapshot> = self
+            .layers
             .iter()
             .map(|layer| LayerSnapshot {
                 adjacency: layer.adjacency.clone(),
@@ -637,14 +642,16 @@ impl HnswIndex {
 
     /// Restore from a snapshot
     pub fn restore_from_snapshot(snapshot: HnswSnapshot, cache_size: usize) -> Self {
-        let layers: Vec<Layer> = snapshot.layers
+        let layers: Vec<Layer> = snapshot
+            .layers
             .into_iter()
             .map(|layer_snap| Layer {
                 adjacency: layer_snap.adjacency,
             })
             .collect();
 
-        let vectors = QuantizedVectorStore::restore_from_snapshot(snapshot.vector_store, cache_size);
+        let vectors =
+            QuantizedVectorStore::restore_from_snapshot(snapshot.vector_store, cache_size);
 
         Self {
             layers,

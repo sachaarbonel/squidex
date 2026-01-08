@@ -25,7 +25,9 @@ impl fmt::Display for SegmentId {
 
 /// Dense document number within a segment (0..max_doc)
 /// This is used internally for efficient posting list storage
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct DocNo(pub u32);
 
 impl DocNo {
