@@ -29,7 +29,7 @@ fjall = "3.0.1"
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -81,6 +81,11 @@ tonic-build = "0.11"
 [dev-dependencies]
 tempfile = "3.9"
 proptest = "1.4"
+criterion = "0.5"
+
+[[bench]]
+name = "search_bench"
+harness = false
 
 [profile.release]
 opt-level = 3

@@ -308,9 +308,16 @@ The vector store uses Product Quantization by default. The configured vector dim
 
 ```bash
 cargo test
+cargo bench
 cargo fmt --check
 cargo clippy -- -D warnings
 ```
+
+### Test Baselines
+
+- Golden search fixtures live in `tests/golden_search.rs` and assert stable keyword/vector/hybrid ordering on a fixed dataset.
+- Benchmarks use Criterion in `benches/search_bench.rs` to capture keyword/vector/hybrid baseline latency trends.
+- Latest recorded baseline results are in `benches/README.md`.
 
 ## Contributing
 
