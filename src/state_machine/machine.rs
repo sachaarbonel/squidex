@@ -1,28 +1,30 @@
-use bytes::Bytes;
-use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use crossbeam::channel;
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::config::IndexSettings;
 use crate::error::{Result, SquidexError};
 use crate::models::*;
+use crate::persistence::DocStore;
+use crate::segment::{SegmentIndex, SegmentIndexConfig};
+use crate::state_machine::indexer::{spawn_indexer, IndexOp};
 use crate::state_machine::scoring::*;
 use crate::state_machine::snapshot::{SearchSnapshot, SNAPSHOT_VERSION};
 use crate::tokenizer::Tokenizer;
 use crate::vector::HnswIndex;
 
-/// Production-ready distributed search state machine
+/// Production-ready distributed search state machine (async indexing).
 pub struct SearchStateMachine {
-    // Document storage
-    documents: RwLock<HashMap<DocumentId, Document>>,
+    doc_store: Arc<DocStore>,
+    text_index: Arc<SegmentIndex>,
+    hnsw_index: Arc<RwLock<HnswIndex>>,
 
-    // Inverted index for keyword search
-    inverted_index: RwLock<HashMap<String, PostingList>>,
-
-    // Vector storage for similarity search (HNSW + Product Quantization)
-    hnsw_index: RwLock<HnswIndex>,
-
-    // Metadata indices for filtering
+    // Metadata indices for filtering (in-memory)
     tag_index: RwLock<HashMap<String, HashSet<DocumentId>>>,
     source_index: RwLock<HashMap<String, HashSet<DocumentId>>>,
     date_index: RwLock<BTreeMap<u64, HashSet<DocumentId>>>,
@@ -30,50 +32,273 @@ pub struct SearchStateMachine {
     // Counters and state
     next_doc_id: AtomicU64,
     total_documents: AtomicU64,
-    index_version: AtomicU64,
+    index_applied_index: Arc<AtomicU64>,
 
     // Configuration
     settings: RwLock<IndexSettings>,
-
-    // Tokenizer instance
     tokenizer: Tokenizer,
-
-    // Flag to track if PQ training is needed
     pq_training_pending: AtomicBool,
+
+    // Async indexer
+    index_cv: Arc<(Mutex<()>, Condvar)>,
+    indexer_tx: channel::Sender<IndexOp>,
+    _indexer_handle: std::thread::JoinHandle<()>,
+}
+
+struct RebuildOutput {
+    next_doc_id: u64,
+    total_docs: u64,
+    max_applied: u64,
+    tag_index: HashMap<String, HashSet<DocumentId>>,
+    source_index: HashMap<String, HashSet<DocumentId>>,
+    date_index: BTreeMap<u64, HashSet<DocumentId>>,
 }
 
 impl SearchStateMachine {
-    pub fn new(settings: IndexSettings) -> Self {
+    pub fn new(settings: IndexSettings, data_dir: PathBuf) -> Result<Self> {
         let tokenizer = Tokenizer::new(&settings.tokenizer_config);
-
-        // Create the HNSW index with PQ configuration
         let hnsw_index = HnswIndex::new(
             settings.vector_dimensions,
             settings.pq_config.num_subspaces,
             Default::default(),
         );
+        let doc_store = Arc::new(DocStore::open(data_dir.join("docstore"))?);
+        let text_index = Arc::new(
+            SegmentIndex::open_with_store(SegmentIndexConfig::default(), data_dir.join("segments"))
+                .map_err(|e| SquidexError::Io(e))?,
+        );
+        let hnsw_index = Arc::new(RwLock::new(hnsw_index));
 
-        Self {
-            documents: RwLock::new(HashMap::new()),
-            inverted_index: RwLock::new(HashMap::new()),
-            hnsw_index: RwLock::new(hnsw_index),
-            tag_index: RwLock::new(HashMap::new()),
-            source_index: RwLock::new(HashMap::new()),
-            date_index: RwLock::new(BTreeMap::new()),
-            next_doc_id: AtomicU64::new(1),
-            total_documents: AtomicU64::new(0),
-            index_version: AtomicU64::new(0),
+        let rebuild = Self::rebuild_from_store(&doc_store, &text_index, &hnsw_index, &tokenizer)?;
+        doc_store.set_index_applied_index(rebuild.max_applied)?;
+
+        let index_applied_index = Arc::new(AtomicU64::new(
+            doc_store
+                .get_index_applied_index()
+                .unwrap_or(rebuild.max_applied),
+        ));
+
+        let index_cv = Arc::new((Mutex::new(()), Condvar::new()));
+
+        // Spawn indexer thread
+        let (tx, rx) = channel::unbounded();
+        let handles = spawn_indexer(
+            tx.clone(),
+            rx,
+            text_index.clone(),
+            hnsw_index.clone(),
+            doc_store.clone(),
+            index_applied_index.clone(),
+            index_cv.clone(),
+            settings.clone(),
+        );
+
+        Ok(Self {
+            doc_store,
+            text_index,
+            hnsw_index,
+            tag_index: RwLock::new(rebuild.tag_index),
+            source_index: RwLock::new(rebuild.source_index),
+            date_index: RwLock::new(rebuild.date_index),
+            next_doc_id: AtomicU64::new(rebuild.next_doc_id),
+            total_documents: AtomicU64::new(rebuild.total_docs),
+            index_applied_index,
             settings: RwLock::new(settings),
             tokenizer,
             pq_training_pending: AtomicBool::new(false),
+            index_cv,
+            indexer_tx: handles.tx,
+            _indexer_handle: handles.join,
+        })
+    }
+
+    fn rebuild_from_store(
+        doc_store: &Arc<DocStore>,
+        text_index: &Arc<SegmentIndex>,
+        hnsw_index: &Arc<RwLock<HnswIndex>>,
+        tokenizer: &Tokenizer,
+    ) -> Result<RebuildOutput> {
+        let pointers = doc_store.list_doc_pointers()?;
+        let tombstones = doc_store.list_tombstones()?;
+        let tombstone_set: HashSet<u64> = tombstones.iter().map(|(d, _)| *d).collect();
+
+        let mut max_applied = tombstones.iter().map(|(_, r)| *r).max().unwrap_or(0);
+        let mut total_docs = 0u64;
+        let mut next_doc_id = 1u64;
+        let mut tag_index: HashMap<String, HashSet<DocumentId>> = HashMap::new();
+        let mut source_index: HashMap<String, HashSet<DocumentId>> = HashMap::new();
+        let mut date_index: BTreeMap<u64, HashSet<DocumentId>> = BTreeMap::new();
+
+        for (doc_id, ptr) in pointers {
+            if tombstone_set.contains(&doc_id) {
+                max_applied = max_applied.max(ptr.raft_index);
+                continue;
+            }
+
+            if let Some(doc) = doc_store.get_document(doc_id)? {
+                let term_freqs = tokenizer.compute_term_frequencies(&doc.content);
+                let doc_len = tokenizer.tokenize(&doc.content).len() as u32;
+                let version = crate::segment::Version::new(doc.updated_at);
+                let _ =
+                    text_index.index_document(doc.id, version, term_freqs, doc_len, ptr.raft_index);
+                {
+                    let mut hnsw = hnsw_index.write();
+                    let _ = hnsw.insert(doc.id, &doc.embedding);
+                }
+                total_docs += 1;
+                next_doc_id = next_doc_id.max(doc.id + 1);
+                max_applied = max_applied.max(ptr.raft_index);
+                Self::update_metadata_maps(
+                    &doc,
+                    &mut tag_index,
+                    &mut source_index,
+                    &mut date_index,
+                );
+            }
+        }
+
+        Ok(RebuildOutput {
+            next_doc_id,
+            total_docs,
+            max_applied,
+            tag_index,
+            source_index,
+            date_index,
+        })
+    }
+
+    /// Allocate and return the next document ID
+    pub fn next_document_id(&self) -> DocumentId {
+        self.next_doc_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn total_documents(&self) -> u64 {
+        self.total_documents.load(Ordering::SeqCst)
+    }
+
+    pub fn index_version(&self) -> u64 {
+        self.index_applied_index.load(Ordering::SeqCst)
+    }
+
+    pub fn settings(&self) -> IndexSettings {
+        self.settings.read().clone()
+    }
+
+    pub fn wait_for_index(&self, min_index: u64, timeout_ms: u64) -> Result<()> {
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(timeout_ms))
+            .unwrap_or(std::time::Instant::now());
+        let (lock, cv) = &*self.index_cv;
+        let mut guard = lock.lock();
+        loop {
+            if self.index_applied_index.load(Ordering::SeqCst) >= min_index {
+                return Ok(());
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline - now;
+            let _ = cv.wait_for(&mut guard, remaining);
+        }
+        Err(SquidexError::SearchError("index_not_ready".to_string()))
+    }
+
+    pub fn get_document(&self, doc_id: DocumentId) -> Option<Document> {
+        self.doc_store.get_document(doc_id).ok().flatten()
+    }
+
+    pub fn apply_command(&self, raft_index: u64, command: &[u8]) -> Result<Bytes> {
+        let cmd: Command = bincode::deserialize(command)
+            .map_err(|e| SquidexError::Internal(format!("Failed to deserialize command: {}", e)))?;
+
+        self.apply_parsed_command(raft_index, cmd)
+    }
+
+    pub fn apply_parsed_command(&self, raft_index: u64, cmd: Command) -> Result<Bytes> {
+        match cmd {
+            Command::IndexDocument(doc) => {
+                let doc_id = self.handle_index(raft_index, doc)?;
+                Ok(Bytes::from(doc_id.to_le_bytes().to_vec()))
+            }
+            Command::UpdateDocument { id, updates } => {
+                self.handle_update(raft_index, id, updates)?;
+                Ok(Bytes::from("OK"))
+            }
+            Command::DeleteDocument(doc_id) => {
+                self.handle_delete(raft_index, doc_id)?;
+                Ok(Bytes::from("OK"))
+            }
+            Command::BatchIndex(docs) => {
+                let mut indexed = Vec::new();
+                for doc in docs {
+                    indexed.push(self.handle_index(raft_index, doc)?);
+                }
+                let response = bincode::serialize(&indexed).map_err(SquidexError::Serialization)?;
+                Ok(Bytes::from(response))
+            }
+            Command::BatchDelete(doc_ids) => {
+                for doc_id in doc_ids {
+                    self.handle_delete(raft_index, doc_id)?;
+                }
+                Ok(Bytes::from("OK"))
+            }
+            Command::OptimizeIndex | Command::CompactIndex => Ok(Bytes::from("OK")),
+            Command::UpdateSettings(settings) => {
+                *self.settings.write() = settings;
+                Ok(Bytes::from("OK"))
+            }
         }
     }
 
-    /// Index a single document
-    pub fn index_document(&self, doc: Document) -> Result<DocumentId> {
+    fn handle_index(&self, raft_index: u64, doc: Document) -> Result<DocumentId> {
         let doc_id = doc.id;
+        self.validate_embedding(&doc)?;
+        let existed = self.doc_store.exists(doc_id)?;
+        self.doc_store.put_document(&doc, raft_index)?;
+        self.update_metadata_indices(&doc);
+        self.total_documents
+            .fetch_add((!existed) as u64, Ordering::SeqCst);
+        self.indexer_tx
+            .send(IndexOp::Upsert { doc, raft_index })
+            .map_err(|e| SquidexError::Internal(format!("indexer send failed: {}", e)))?;
+        Ok(doc_id)
+    }
 
-        // Validate embedding dimensions
+    fn handle_update(
+        &self,
+        raft_index: u64,
+        doc_id: DocumentId,
+        updates: DocumentUpdate,
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut doc = self
+            .doc_store
+            .get_document(doc_id)?
+            .ok_or(SquidexError::DocumentNotFound(doc_id))?;
+        updates.apply_to(&mut doc);
+        self.handle_index(raft_index, doc)?;
+        Ok(())
+    }
+
+    fn handle_delete(&self, raft_index: u64, doc_id: DocumentId) -> Result<()> {
+        let existed = self.doc_store.exists(doc_id)?;
+        if existed {
+            if let Some(doc) = self.doc_store.get_document(doc_id)? {
+                self.remove_from_metadata_indices(&doc);
+            }
+            self.total_documents.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.doc_store.tombstone(doc_id, raft_index)?;
+        self.indexer_tx
+            .send(IndexOp::Delete { doc_id, raft_index })
+            .map_err(|e| SquidexError::Internal(format!("indexer send failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn validate_embedding(&self, doc: &Document) -> Result<()> {
         let settings = self.settings.read();
         if doc.embedding.len() != settings.vector_dimensions {
             return Err(SquidexError::InvalidEmbeddingDimensions {
@@ -81,257 +306,90 @@ impl SearchStateMachine {
                 actual: doc.embedding.len(),
             });
         }
-        let min_training_vectors = settings.pq_config.min_training_vectors;
-        let pq_enabled = settings.pq_config.enabled;
-        drop(settings);
-
-        // Tokenize content for inverted index
-        let term_frequencies = self.tokenizer.compute_term_frequencies(&doc.content);
-
-        // Update inverted index
-        {
-            let mut idx = self.inverted_index.write();
-            for (term, freq) in &term_frequencies {
-                let posting = idx
-                    .entry(term.clone())
-                    .or_insert_with(|| PostingList::new(term.clone()));
-                posting.add_document(doc_id, *freq);
-            }
-        }
-
-        // Update HNSW index (with auto-training check)
-        {
-            let mut index = self.hnsw_index.write();
-            index.insert(doc_id, &doc.embedding)?;
-
-            // Check if we should trigger auto-training
-            if pq_enabled && index.should_auto_train(min_training_vectors) {
-                self.pq_training_pending.store(true, Ordering::SeqCst);
-            }
-        }
-
-        // Update metadata indices
-        self.update_metadata_indices(&doc);
-
-        // Store document
-        self.documents.write().insert(doc_id, doc);
-        self.total_documents.fetch_add(1, Ordering::SeqCst);
-        self.index_version.fetch_add(1, Ordering::SeqCst);
-
-        // Trigger auto-training if pending (do this outside the lock)
-        if self.pq_training_pending.swap(false, Ordering::SeqCst) {
-            self.try_auto_train();
-        }
-
-        Ok(doc_id)
-    }
-
-    /// Attempt to auto-train the PQ codebooks if conditions are met
-    fn try_auto_train(&self) {
-        let mut index = self.hnsw_index.write();
-        if let Err(e) = index.auto_train() {
-            // Log the error but don't fail the operation
-            tracing::warn!("PQ auto-training failed: {}", e);
-        }
-    }
-
-    /// Delete a document
-    pub fn delete_document(&self, doc_id: DocumentId) -> Result<()> {
-        // Remove from document store
-        let doc = self
-            .documents
-            .write()
-            .remove(&doc_id)
-            .ok_or(SquidexError::DocumentNotFound(doc_id))?;
-
-        // Remove from inverted index
-        {
-            let tokens = self.tokenizer.unique_terms(&doc.content);
-            let mut idx = self.inverted_index.write();
-            for token in tokens {
-                if let Some(posting) = idx.get_mut(&token) {
-                    posting.remove_document(doc_id);
-                    if posting.is_empty() {
-                        idx.remove(&token);
-                    }
-                }
-            }
-        }
-
-        // Remove from HNSW index (soft delete)
-        self.hnsw_index.write().remove(doc_id);
-
-        // Remove from metadata indices
-        self.remove_from_metadata_indices(&doc);
-
-        self.total_documents.fetch_sub(1, Ordering::SeqCst);
-        self.index_version.fetch_add(1, Ordering::SeqCst);
-
         Ok(())
     }
 
-    /// Update a document
-    pub fn update_document(&self, doc_id: DocumentId, updates: DocumentUpdate) -> Result<()> {
-        if updates.is_empty() {
-            return Ok(());
-        }
-
-        // Get existing document
-        let mut doc = {
-            let docs = self.documents.read();
-            docs.get(&doc_id)
-                .cloned()
-                .ok_or(SquidexError::DocumentNotFound(doc_id))?
-        };
-
-        // Remove old indices
-        self.delete_document(doc_id)?;
-
-        // Apply updates
-        updates.apply_to(&mut doc);
-
-        // Re-index
-        self.index_document(doc)?;
-        Ok(())
-    }
-
-    /// Get document by ID
-    pub fn get_document(&self, doc_id: DocumentId) -> Option<Document> {
-        self.documents.read().get(&doc_id).cloned()
-    }
-
-    /// Keyword search using BM25 ranking
     pub fn keyword_search(&self, query: &str, top_k: usize) -> Vec<SearchResult> {
-        let query_tokens = self.tokenizer.tokenize(query);
-        if query_tokens.is_empty() {
+        let query_terms = self.tokenizer.tokenize(query);
+        if query_terms.is_empty() || top_k == 0 {
             return Vec::new();
         }
-
-        let idx = self.inverted_index.read();
-        let docs = self.documents.read();
-
-        let total_docs = self.total_documents.load(Ordering::SeqCst) as f32;
-        if total_docs == 0.0 {
-            return Vec::new();
-        }
-
-        let avg_doc_len = self.compute_avg_doc_length();
-
-        let mut scores: HashMap<DocumentId, f32> = HashMap::new();
-
-        for token in &query_tokens {
-            if let Some(posting) = idx.get(token) {
-                let df = posting.document_frequency() as f32;
-
-                for &doc_id in &posting.doc_ids {
-                    if let Some(doc) = docs.get(&doc_id) {
-                        let tf = *posting.term_frequencies.get(&doc_id).unwrap_or(&0) as f32;
-                        let doc_len = self.tokenizer.tokenize(&doc.content).len() as f32;
-                        let score = bm25_score(tf, df, total_docs, doc_len, avg_doc_len);
-
-                        *scores.entry(doc_id).or_insert(0.0) += score;
-                    }
-                }
+        let results = self
+            .text_index
+            .keyword_search(&query_terms, top_k * 2)
+            .unwrap_or_default();
+        let mut filtered = Vec::new();
+        for r in results {
+            if self.doc_store.is_tombstoned(r.doc_id).unwrap_or(false) {
+                continue;
             }
+            filtered.push(SearchResult::new(r.doc_id, r.score));
         }
-
-        self.collect_top_k_results(scores, top_k)
+        filtered.truncate(top_k);
+        filtered
     }
 
-    /// Vector similarity search using HNSW with two-phase routing
-    ///
-    /// - If candidate_count <= brute_force_threshold: use PQ ADC brute force
-    /// - Else: use HNSW with adaptive ef_search
     pub fn vector_search(&self, query_embedding: &[f32], top_k: usize) -> Vec<SearchResult> {
-        let index = self.hnsw_index.read();
-        let settings = self.settings.read();
-
+        if top_k == 0 {
+            return Vec::new();
+        }
+        let settings = self.settings.read().clone();
         if query_embedding.len() != settings.vector_dimensions {
             return Vec::new();
         }
 
-        // brute_force_threshold for filtered ANN
-        const BRUTE_FORCE_THRESHOLD: usize = 1000;
+        let index = self.hnsw_index.read();
+        // Prefer HNSW path
+        if index.len() > 0 && index.is_trained() {
+            if let Ok(results) = index.search_with_ef(
+                query_embedding,
+                top_k,
+                index.compute_adaptive_ef(index.len()),
+            ) {
+                return results
+                    .into_iter()
+                    .filter(|(doc_id, _)| !self.doc_store.is_tombstoned(*doc_id).unwrap_or(false))
+                    .map(|(doc_id, distance)| {
+                        // Convert distance to similarity score
+                        let score = 1.0 - distance;
+                        SearchResult::new(doc_id, score)
+                    })
+                    .collect();
+            }
+        }
+        drop(index);
 
-        let total_vectors = index.len();
-        drop(settings);
-
-        // If HNSW is trained and we have enough vectors, use HNSW
-        if index.is_trained() && total_vectors > BRUTE_FORCE_THRESHOLD {
-            // Use adaptive ef_search based on collection size
-            let ef = index.compute_adaptive_ef(total_vectors);
-
-            match index.search_with_ef(query_embedding, top_k, ef) {
-                Ok(results) => {
-                    // Convert distance to similarity score (inverse relationship)
-                    let max_dist = results.iter().map(|(_, d)| *d).fold(0.0f32, f32::max);
-                    let max_dist = if max_dist == 0.0 { 1.0 } else { max_dist };
-
-                    return results
-                        .into_iter()
-                        .map(|(doc_id, distance)| {
-                            let score = 1.0 - (distance / (max_dist + 1.0));
-                            SearchResult::new(doc_id, score)
-                        })
-                        .collect();
+        // Brute force over stored docs
+        let mut scored: Vec<(DocumentId, f32)> = Vec::new();
+        if let Ok(ptrs) = self.doc_store.list_doc_pointers() {
+            for (doc_id, _) in ptrs {
+                if self.doc_store.is_tombstoned(doc_id).unwrap_or(false) {
+                    continue;
                 }
-                Err(e) => {
-                    tracing::warn!("HNSW search failed, falling back to brute force: {}", e);
+                if let Some(doc) = self.doc_store.get_document(doc_id).ok().flatten() {
+                    let score = match settings.similarity_metric {
+                        SimilarityMetric::Cosine => {
+                            cosine_similarity(query_embedding, &doc.embedding)
+                        }
+                        SimilarityMetric::Euclidean => {
+                            euclidean_similarity(query_embedding, &doc.embedding)
+                        }
+                        SimilarityMetric::DotProduct => {
+                            dot_product(query_embedding, &doc.embedding)
+                        }
+                    };
+                    scored.push((doc_id, score));
                 }
             }
         }
-
-        // Brute force path: use PQ ADC when trained, else raw embeddings
-        if index.is_trained() {
-            match index.brute_force_search(query_embedding, top_k) {
-                Ok(results) => {
-                    let max_dist = results.iter().map(|(_, d)| *d).fold(0.0f32, f32::max);
-                    let max_dist = if max_dist == 0.0 { 1.0 } else { max_dist };
-
-                    return results
-                        .into_iter()
-                        .map(|(doc_id, distance)| {
-                            let score = 1.0 - (distance / (max_dist + 1.0));
-                            SearchResult::new(doc_id, score)
-                        })
-                        .collect();
-                }
-                Err(e) => {
-                    tracing::warn!("PQ brute force failed, falling back to raw: {}", e);
-                }
-            }
-        }
-
-        // Final fallback: brute force on raw embeddings
-        let settings = self.settings.read();
-        let docs = self.documents.read();
-        let similarity_metric = settings.similarity_metric.clone();
-        drop(settings);
-
-        let mut scores: Vec<(DocumentId, f32)> = docs
-            .iter()
-            .map(|(doc_id, doc)| {
-                let score = match similarity_metric {
-                    SimilarityMetric::Cosine => cosine_similarity(query_embedding, &doc.embedding),
-                    SimilarityMetric::Euclidean => {
-                        euclidean_similarity(query_embedding, &doc.embedding)
-                    }
-                    SimilarityMetric::DotProduct => dot_product(query_embedding, &doc.embedding),
-                };
-                (*doc_id, score)
-            })
-            .collect();
-
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scores.truncate(top_k);
-
-        scores
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        scored
             .into_iter()
             .map(|(doc_id, score)| SearchResult::new(doc_id, score))
             .collect()
     }
 
-    /// Hybrid search combining keyword and vector
     pub fn hybrid_search(
         &self,
         query: &str,
@@ -339,13 +397,13 @@ impl SearchStateMachine {
         top_k: usize,
         keyword_weight: f32,
     ) -> Vec<SearchResult> {
+        if top_k == 0 {
+            return Vec::new();
+        }
         let vector_weight = 1.0 - keyword_weight;
-
-        // Get results from both methods
         let keyword_results = self.keyword_search(query, top_k * 2);
         let vector_results = self.vector_search(query_embedding, top_k * 2);
 
-        // Normalize and combine scores
         let keyword_max = keyword_results
             .iter()
             .map(|r| r.score)
@@ -356,33 +414,28 @@ impl SearchStateMachine {
             .fold(0.0f32, f32::max);
 
         let mut combined: HashMap<DocumentId, f32> = HashMap::new();
-
-        for result in keyword_results {
-            let normalized = normalize_score(result.score, keyword_max);
-            *combined.entry(result.doc_id).or_insert(0.0) += normalized * keyword_weight;
+        for r in keyword_results {
+            let normalized = normalize_score(r.score, keyword_max);
+            *combined.entry(r.doc_id).or_insert(0.0) += normalized * keyword_weight;
         }
-
-        for result in vector_results {
-            let normalized = normalize_score(result.score, vector_max);
-            *combined.entry(result.doc_id).or_insert(0.0) += normalized * vector_weight;
+        for r in vector_results {
+            let normalized = normalize_score(r.score, vector_max);
+            *combined.entry(r.doc_id).or_insert(0.0) += normalized * vector_weight;
         }
 
         self.collect_top_k_results(combined, top_k)
     }
 
-    /// Apply filters to a set of document IDs
     pub fn apply_filters(&self, doc_ids: &mut HashSet<DocumentId>, filters: &[Filter]) {
         if filters.is_empty() {
             return;
         }
-
         for filter in filters {
             let matching = self.get_filtered_documents(filter);
             doc_ids.retain(|id| matching.contains(id));
         }
     }
 
-    /// Get documents matching a specific filter
     fn get_filtered_documents(&self, filter: &Filter) -> HashSet<DocumentId> {
         match filter {
             Filter::Tag(tag) => self.tag_index.read().get(tag).cloned().unwrap_or_default(),
@@ -399,90 +452,37 @@ impl SearchStateMachine {
                     .collect()
             }
             Filter::Custom { key, value } => {
-                let docs = self.documents.read();
-                docs.iter()
-                    .filter(|(_, doc)| doc.metadata.custom.get(key) == Some(value))
-                    .map(|(id, _)| *id)
-                    .collect()
+                // Fallback: scan metadata indexes is not available; use doc store
+                if let Ok(ptrs) = self.doc_store.list_doc_pointers() {
+                    ptrs.into_iter()
+                        .filter_map(|(doc_id, _)| {
+                            self.doc_store.get_document(doc_id).ok().flatten()
+                        })
+                        .filter(|doc| doc.metadata.custom.get(key) == Some(value))
+                        .map(|doc| doc.id)
+                        .collect()
+                } else {
+                    HashSet::new()
+                }
             }
         }
     }
-
-    /// Compact the index - remove empty structures
-    pub fn optimize_index(&self) -> Result<()> {
-        // Remove empty posting lists
-        self.inverted_index
-            .write()
-            .retain(|_, posting| !posting.is_empty());
-
-        // Shrink hash maps
-        self.documents.write().shrink_to_fit();
-        self.inverted_index.write().shrink_to_fit();
-        // Note: HnswIndex uses compact storage by design (PQ + HNSW)
-
-        Ok(())
-    }
-
-    // Helper methods
 
     fn collect_top_k_results(
         &self,
         scores: HashMap<DocumentId, f32>,
         top_k: usize,
     ) -> Vec<SearchResult> {
-        let mut results: Vec<_> = scores
-            .into_iter()
-            .map(|(doc_id, score)| (doc_id, score))
-            .collect();
+        let mut results: Vec<_> = scores.into_iter().collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(top_k);
-
         results
             .into_iter()
             .map(|(doc_id, score)| SearchResult::new(doc_id, score))
             .collect()
     }
 
-    fn compute_avg_doc_length(&self) -> f32 {
-        let docs = self.documents.read();
-        if docs.is_empty() {
-            return 1.0;
-        }
-        let total_tokens: usize = docs
-            .values()
-            .map(|doc| self.tokenizer.tokenize(&doc.content).len())
-            .sum();
-        total_tokens as f32 / docs.len() as f32
-    }
-
-    fn update_metadata_indices(&self, doc: &Document) {
-        // Tag index
-        {
-            let mut idx = self.tag_index.write();
-            for tag in &doc.metadata.tags {
-                idx.entry(tag.clone()).or_default().insert(doc.id);
-            }
-        }
-
-        // Source index
-        if let Some(source) = &doc.metadata.source {
-            self.source_index
-                .write()
-                .entry(source.clone())
-                .or_default()
-                .insert(doc.id);
-        }
-
-        // Date index
-        self.date_index
-            .write()
-            .entry(doc.created_at)
-            .or_default()
-            .insert(doc.id);
-    }
-
     fn remove_from_metadata_indices(&self, doc: &Document) {
-        // Tag index
         {
             let mut idx = self.tag_index.write();
             for tag in &doc.metadata.tags {
@@ -494,8 +494,6 @@ impl SearchStateMachine {
                 }
             }
         }
-
-        // Source index
         if let Some(source) = &doc.metadata.source {
             let mut idx = self.source_index.write();
             if let Some(set) = idx.get_mut(source) {
@@ -505,8 +503,6 @@ impl SearchStateMachine {
                 }
             }
         }
-
-        // Date index
         {
             let mut idx = self.date_index.write();
             if let Some(set) = idx.get_mut(&doc.created_at) {
@@ -518,56 +514,76 @@ impl SearchStateMachine {
         }
     }
 
-    // Public accessors for API layer
-
-    pub fn total_documents(&self) -> u64 {
-        self.total_documents.load(Ordering::SeqCst)
+    fn update_metadata_indices(&self, doc: &Document) {
+        {
+            let mut idx = self.tag_index.write();
+            for tag in &doc.metadata.tags {
+                idx.entry(tag.clone()).or_default().insert(doc.id);
+            }
+        }
+        if let Some(source) = &doc.metadata.source {
+            self.source_index
+                .write()
+                .entry(source.clone())
+                .or_default()
+                .insert(doc.id);
+        }
+        self.date_index
+            .write()
+            .entry(doc.created_at)
+            .or_default()
+            .insert(doc.id);
     }
 
-    pub fn index_version(&self) -> u64 {
-        self.index_version.load(Ordering::SeqCst)
+    fn update_metadata_maps(
+        doc: &Document,
+        tags: &mut HashMap<String, HashSet<DocumentId>>,
+        sources: &mut HashMap<String, HashSet<DocumentId>>,
+        dates: &mut BTreeMap<u64, HashSet<DocumentId>>,
+    ) {
+        for tag in &doc.metadata.tags {
+            tags.entry(tag.clone()).or_default().insert(doc.id);
+        }
+        if let Some(source) = &doc.metadata.source {
+            sources.entry(source.clone()).or_default().insert(doc.id);
+        }
+        dates.entry(doc.created_at).or_default().insert(doc.id);
     }
 
-    pub fn settings(&self) -> IndexSettings {
-        self.settings.read().clone()
-    }
-
-    /// Allocate and return the next document ID
-    pub fn next_document_id(&self) -> DocumentId {
-        self.next_doc_id.fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Create a complete snapshot of the search index
+    /// Create a snapshot (serialize live docs + HNSW)
     pub fn create_snapshot(&self) -> Vec<u8> {
+        let mut documents = HashMap::new();
+        if let Ok(ptrs) = self.doc_store.list_doc_pointers() {
+            for (doc_id, _) in ptrs {
+                if let Some(doc) = self.doc_store.get_document(doc_id).ok().flatten() {
+                    documents.insert(doc_id, doc);
+                }
+            }
+        }
         let hnsw_snapshot = self.hnsw_index.read().create_snapshot();
-
         let snapshot = SearchSnapshot::new(
-            self.documents.read().clone(),
-            self.inverted_index.read().clone(),
+            documents,
+            HashMap::new(), // inverted index not used anymore
             hnsw_snapshot,
             self.tag_index.read().clone(),
             self.source_index.read().clone(),
             self.date_index.read().clone(),
             self.next_doc_id.load(Ordering::SeqCst),
-            self.total_documents.load(Ordering::SeqCst),
-            self.index_version.load(Ordering::SeqCst),
-            self.settings.read().clone(),
+            self.total_documents(),
+            self.index_version(),
+            self.settings(),
         );
-
         snapshot.to_bytes().unwrap_or_default()
     }
 
-    /// Restore from a snapshot
+    /// Restore from snapshot by rewriting the doc store and rebuilding indexes.
     pub fn restore_snapshot(&self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-
         let snapshot = SearchSnapshot::from_bytes(data).map_err(|e| {
             SquidexError::Internal(format!("Failed to deserialize snapshot: {}", e))
         })?;
-
-        // Validate version compatibility
         if !snapshot.is_compatible() {
             return Err(SquidexError::IncompatibleSnapshot {
                 expected: SNAPSHOT_VERSION,
@@ -575,202 +591,145 @@ impl SearchStateMachine {
             });
         }
 
-        // Get cache size from settings
-        let cache_size = snapshot.settings.pq_config.full_precision_cache_size;
-
-        // Restore HNSW index from snapshot
-        let restored_hnsw_index =
-            HnswIndex::restore_from_snapshot(snapshot.hnsw_index, cache_size);
-
-        // Atomically restore all state
-        *self.documents.write() = snapshot.documents;
-        *self.inverted_index.write() = snapshot.inverted_index;
-        *self.hnsw_index.write() = restored_hnsw_index;
-        *self.tag_index.write() = snapshot.tag_index;
-        *self.source_index.write() = snapshot.source_index;
-        *self.date_index.write() = snapshot.date_index;
-        self.next_doc_id
-            .store(snapshot.next_doc_id, Ordering::SeqCst);
-        self.total_documents
-            .store(snapshot.total_documents, Ordering::SeqCst);
-        self.index_version
-            .store(snapshot.index_version, Ordering::SeqCst);
-        *self.settings.write() = snapshot.settings;
-
-        Ok(())
-    }
-
-    /// Apply a command (used by Raft state machine trait)
-    pub fn apply_command(&self, command: &[u8]) -> Result<Bytes> {
-        let cmd: Command = bincode::deserialize(command)
-            .map_err(|e| SquidexError::Internal(format!("Failed to deserialize command: {}", e)))?;
-
-        match cmd {
-            Command::IndexDocument(doc) => {
-                let doc_id = self.index_document(doc)?;
-                Ok(Bytes::from(doc_id.to_le_bytes().to_vec()))
-            }
-
-            Command::UpdateDocument { id, updates } => {
-                self.update_document(id, updates)?;
-                Ok(Bytes::from("OK"))
-            }
-
-            Command::DeleteDocument(doc_id) => {
-                self.delete_document(doc_id)?;
-                Ok(Bytes::from("OK"))
-            }
-
-            Command::BatchIndex(docs) => {
-                let mut indexed = Vec::new();
-                for doc in docs {
-                    match self.index_document(doc) {
-                        Ok(id) => indexed.push(id),
-                        Err(e) => {
-                            return Err(SquidexError::IndexError(format!(
-                                "Batch index failed: {}",
-                                e
-                            )))
-                        }
-                    }
-                }
-                let response =
-                    bincode::serialize(&indexed).map_err(|e| SquidexError::Serialization(e))?;
-                Ok(Bytes::from(response))
-            }
-
-            Command::BatchDelete(doc_ids) => {
-                for doc_id in doc_ids {
-                    self.delete_document(doc_id)?;
-                }
-                Ok(Bytes::from("OK"))
-            }
-
-            Command::OptimizeIndex => {
-                self.optimize_index()?;
-                Ok(Bytes::from("OK"))
-            }
-
-            Command::CompactIndex => {
-                self.optimize_index()?; // Same implementation for now
-                Ok(Bytes::from("OK"))
-            }
-
-            Command::UpdateSettings(settings) => {
-                *self.settings.write() = settings;
-                Ok(Bytes::from("OK"))
-            }
+        self.doc_store.clear_all()?;
+        for (_, doc) in snapshot.documents.iter() {
+            self.doc_store.put_document(doc, snapshot.index_version)?;
         }
+
+        // Rebuild indexes and metadata
+        let rebuild = Self::rebuild_from_store(
+            &self.doc_store,
+            &self.text_index,
+            &self.hnsw_index,
+            &self.tokenizer,
+        )?;
+        *self.tag_index.write() = rebuild.tag_index;
+        *self.source_index.write() = rebuild.source_index;
+        *self.date_index.write() = rebuild.date_index;
+        self.next_doc_id
+            .store(rebuild.next_doc_id, Ordering::SeqCst);
+        self.total_documents
+            .store(rebuild.total_docs, Ordering::SeqCst);
+        self.index_applied_index
+            .store(rebuild.max_applied, Ordering::SeqCst);
+        self.doc_store
+            .set_index_applied_index(rebuild.max_applied)?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
-    fn create_test_document(id: u64, content: &str, embedding: Vec<f32>) -> Document {
+    fn create_settings(dim: usize) -> IndexSettings {
+        let mut settings = IndexSettings::default();
+        settings.vector_dimensions = dim;
+        settings.pq_config.num_subspaces = dim; // 1 dim per subspace for tests
+        settings.pq_config.min_training_vectors = 10;
+        settings
+    }
+
+    fn create_doc(id: u64, content: &str, dims: usize) -> Document {
         Document {
             id,
             content: content.to_string(),
-            embedding,
+            embedding: vec![1.0; dims],
             metadata: DocumentMetadata::default(),
-            created_at: current_timestamp(),
-            updated_at: current_timestamp(),
+            created_at: 0,
+            updated_at: 0,
         }
     }
 
     #[test]
-    fn test_index_and_retrieve_document() {
-        let settings = IndexSettings::default();
-        let machine = SearchStateMachine::new(settings);
+    fn test_index_and_get_and_delete() {
+        let tmp = TempDir::new().unwrap();
+        let dims = 4;
+        let settings = create_settings(dims);
+        let machine = SearchStateMachine::new(settings, tmp.path().to_path_buf()).unwrap();
 
-        let doc = create_test_document(1, "hello world", vec![1.0; 384]);
-        machine.index_document(doc.clone()).unwrap();
+        let doc = create_doc(1, "hello world", dims);
+        machine
+            .apply_parsed_command(1, Command::IndexDocument(doc))
+            .unwrap();
+        machine.wait_for_index(1, 2000).unwrap();
 
-        let retrieved = machine.get_document(1).unwrap();
-        assert_eq!(retrieved.id, 1);
-        assert_eq!(retrieved.content, "hello world");
-        assert_eq!(machine.total_documents(), 1);
-    }
+        let got = machine.get_document(1).unwrap();
+        assert_eq!(got.id, 1);
 
-    #[test]
-    fn test_delete_document() {
-        let settings = IndexSettings::default();
-        let machine = SearchStateMachine::new(settings);
-
-        let doc = create_test_document(1, "hello world", vec![1.0; 384]);
-        machine.index_document(doc).unwrap();
-        assert_eq!(machine.total_documents(), 1);
-
-        machine.delete_document(1).unwrap();
-        assert_eq!(machine.total_documents(), 0);
+        machine
+            .apply_parsed_command(2, Command::DeleteDocument(1))
+            .unwrap();
+        machine.wait_for_index(2, 2000).unwrap();
         assert!(machine.get_document(1).is_none());
     }
 
     #[test]
-    fn test_keyword_search() {
-        let settings = IndexSettings::default();
-        let machine = SearchStateMachine::new(settings);
+    fn test_keyword_and_vector_search() {
+        let tmp = TempDir::new().unwrap();
+        let dims = 3;
+        let settings = create_settings(dims);
+        let machine = SearchStateMachine::new(settings, tmp.path().to_path_buf()).unwrap();
 
-        let doc1 = create_test_document(1, "rust programming language", vec![1.0; 384]);
-        let doc2 = create_test_document(2, "python programming tutorial", vec![1.0; 384]);
-        let doc3 = create_test_document(3, "rust async programming", vec![1.0; 384]);
+        let d1 = Document {
+            id: 1,
+            content: "rust programming".into(),
+            embedding: vec![1.0, 0.0, 0.0],
+            metadata: DocumentMetadata::default(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        let d2 = Document {
+            id: 2,
+            content: "python coding".into(),
+            embedding: vec![0.0, 1.0, 0.0],
+            metadata: DocumentMetadata::default(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        machine
+            .apply_parsed_command(1, Command::IndexDocument(d1))
+            .unwrap();
+        machine
+            .apply_parsed_command(2, Command::IndexDocument(d2))
+            .unwrap();
+        machine.wait_for_index(2, 2000).unwrap();
 
-        machine.index_document(doc1).unwrap();
-        machine.index_document(doc2).unwrap();
-        machine.index_document(doc3).unwrap();
+        let kw = machine.keyword_search("rust", 5);
+        assert_eq!(kw.len(), 1);
+        assert_eq!(kw[0].doc_id, 1);
 
-        let results = machine.keyword_search("rust programming", 10);
-
-        assert!(!results.is_empty());
-        // Both doc1 and doc3 should match "rust", both have "programming"
-        assert!(results.iter().any(|r| r.doc_id == 1 || r.doc_id == 3));
+        let vec_res = machine.vector_search(&[1.0, 0.0, 0.0], 2);
+        assert_eq!(vec_res.len(), 2);
+        assert_eq!(vec_res[0].doc_id, 1);
     }
 
     #[test]
-    fn test_vector_search() {
-        // Use 3 dimensions with 3 subspaces (1 dim per subspace) for testing
-        let mut settings = IndexSettings::default();
-        settings.vector_dimensions = 3;
-        settings.pq_config.num_subspaces = 3;
-        settings.pq_config.min_training_vectors = 10; // Won't trigger training with 3 docs
+    fn test_snapshot_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let dims = 3;
+        let settings = create_settings(dims);
+        let machine = SearchStateMachine::new(settings.clone(), tmp.path().to_path_buf()).unwrap();
 
-        let doc1 = create_test_document(1, "test doc 1", vec![1.0, 0.0, 0.0]);
-        let doc2 = create_test_document(2, "test doc 2", vec![0.0, 1.0, 0.0]);
-        let doc3 = create_test_document(3, "test doc 3", vec![0.9, 0.1, 0.0]);
+        for i in 1..=3 {
+            let doc = create_doc(i, "snapshot doc", dims);
+            machine
+                .apply_parsed_command(i as u64, Command::IndexDocument(doc))
+                .unwrap();
+        }
+        machine.wait_for_index(3, 10_000).unwrap();
 
-        let machine = SearchStateMachine::new(settings);
+        let snapshot = machine.create_snapshot();
+        assert!(!snapshot.is_empty());
 
-        machine.index_document(doc1).unwrap();
-        machine.index_document(doc2).unwrap();
-        machine.index_document(doc3).unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let machine2 =
+            SearchStateMachine::new(settings, tmp2.path().to_path_buf()).unwrap();
+        machine2.restore_snapshot(&snapshot).unwrap();
 
-        let query = vec![1.0, 0.0, 0.0];
-        let results = machine.vector_search(&query, 2);
-
-        assert_eq!(results.len(), 2);
-        // doc1 should be most similar, then doc3
-        assert_eq!(results[0].doc_id, 1);
-    }
-
-    #[test]
-    fn test_snapshot_and_restore() {
-        let settings = IndexSettings::default();
-        let machine = SearchStateMachine::new(settings.clone());
-
-        let doc = create_test_document(1, "hello world", vec![1.0; 384]);
-        machine.index_document(doc).unwrap();
-
-        // Create snapshot
-        let snapshot_data = machine.create_snapshot();
-        assert!(!snapshot_data.is_empty());
-
-        // Create new machine and restore
-        let machine2 = SearchStateMachine::new(settings);
-        machine2.restore_snapshot(&snapshot_data).unwrap();
-
-        assert_eq!(machine2.total_documents(), 1);
-        let retrieved = machine2.get_document(1).unwrap();
-        assert_eq!(retrieved.content, "hello world");
+        assert_eq!(machine2.total_documents(), 3);
+        let results = machine2.keyword_search("snapshot", 3);
+        assert_eq!(results.len(), 3);
     }
 }

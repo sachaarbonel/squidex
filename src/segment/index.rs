@@ -12,6 +12,7 @@ use super::buffer::{BufferConfig, MutableBuffer};
 use super::manifest::{ManifestHolder, SegmentManifest};
 use super::reader::{SegmentMeta, SegmentReader};
 use super::statistics::{Bm25Params, IndexStatistics, SegmentStatistics};
+use super::store::SegmentStore;
 use super::types::{DocNo, DocumentId, RaftIndex, SegmentId, Version};
 use super::writer::SegmentWriter;
 
@@ -85,6 +86,8 @@ pub struct SegmentIndex {
     manifest: ManifestHolder,
     /// Index configuration
     config: SegmentIndexConfig,
+    /// Optional on-disk store
+    store: Option<SegmentStore>,
 }
 
 impl SegmentIndex {
@@ -95,12 +98,38 @@ impl SegmentIndex {
             segments: RwLock::new(Vec::new()),
             manifest: ManifestHolder::default(),
             config,
+            store: None,
         }
     }
 
     /// Create with default configuration
     pub fn default_config() -> Self {
         Self::new(SegmentIndexConfig::default())
+    }
+
+    /// Open with a persistent store directory
+    pub fn open_with_store(config: SegmentIndexConfig, dir: std::path::PathBuf) -> io::Result<Self> {
+        let store = SegmentStore::new(dir)?;
+        let manifest = store.load_manifest().unwrap_or_else(|_| SegmentManifest::new());
+        let mut index = Self {
+            buffer: RwLock::new(MutableBuffer::new()),
+            segments: RwLock::new(Vec::new()),
+            manifest: ManifestHolder::new(manifest),
+            config,
+            store: Some(store),
+        };
+        // Load segments
+        if let Some(store) = &index.store {
+            let manifest_snapshot = index.manifest.snapshot();
+            let mut segs = Vec::new();
+            for entry in manifest_snapshot.segments.iter() {
+                if let Ok(reader) = store.read_segment(entry.meta.clone()) {
+                    segs.push(reader);
+                }
+            }
+            *index.segments.write().unwrap() = segs;
+        }
+        Ok(index)
     }
 
     /// Index a document
@@ -149,6 +178,11 @@ impl SegmentIndex {
         let writer = SegmentWriter::new(segment_id);
         let result = writer.write_from_buffer(&buffer)?;
 
+        // Persist segment if store is configured
+        if let Some(store) = &self.store {
+            store.write_segment(&result)?;
+        }
+
         // Add to segments
         let reader = Arc::new(result.reader);
         {
@@ -163,6 +197,12 @@ impl SegmentIndex {
                 m.update_index_applied(max_raft);
             }
         });
+
+        // Persist manifest if store configured
+        if let Some(store) = &self.store {
+            let snapshot = self.manifest.snapshot();
+            let _ = store.save_manifest(&snapshot);
+        }
 
         // Clear buffer
         buffer.clear();
@@ -419,6 +459,11 @@ impl SegmentIndex {
             }
             m.add_segment(merged_segment.meta().clone());
         });
+
+        if let Some(store) = &self.store {
+            let snapshot = self.manifest.snapshot();
+            let _ = store.save_manifest(&snapshot);
+        }
 
         Ok(())
     }

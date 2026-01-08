@@ -9,12 +9,17 @@ pub struct IndexRequest {
     pub embedding: Vec<f32>,
     #[serde(default)]
     pub metadata: Option<DocumentMetadata>,
+    #[serde(default)]
+    pub refresh: Option<String>, // "none" (default) | "wait_for"
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Response after indexing a document
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexResponse {
     pub id: DocumentId,
+    pub commit_index: u64,
 }
 
 /// Search request
@@ -30,6 +35,10 @@ pub struct SearchRequestApi {
     pub top_k: usize,
     #[serde(default)]
     pub filters: Vec<Filter>,
+    #[serde(default)]
+    pub min_index_applied_index: Option<u64>,
+    #[serde(default)]
+    pub wait_for: Option<u64>, // optional wait_for milliseconds until index_applied_index >= min
 }
 
 fn default_keyword_weight() -> f32 {

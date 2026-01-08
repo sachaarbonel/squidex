@@ -8,6 +8,7 @@ pub mod segment;
 pub mod state_machine;
 pub mod tokenizer;
 pub mod vector;
+pub mod persistence;
 
 pub use api::{create_router, AppState};
 pub use config::{

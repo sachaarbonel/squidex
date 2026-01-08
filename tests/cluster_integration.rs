@@ -1,5 +1,5 @@
 use squidex::{
-    Document, DocumentMetadata, IndexSettings, NodeConfig, SearchStateMachine, SquidexNode,
+    Command, Document, DocumentMetadata, IndexSettings, NodeConfig, SearchStateMachine, SquidexNode,
 };
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -31,7 +31,8 @@ async fn test_single_node_operations() -> Result<(), Box<dyn std::error::Error>>
     let temp_dir = TempDir::new()?;
 
     let settings = create_test_settings();
-    let state_machine = Arc::new(SearchStateMachine::new(settings));
+    let state_machine =
+        Arc::new(SearchStateMachine::new(settings, temp_dir.path().to_path_buf())?);
 
     let config = NodeConfig::new(
         1,
@@ -51,7 +52,8 @@ async fn test_single_node_operations() -> Result<(), Box<dyn std::error::Error>>
 
     // Index a document directly (bypassing Raft for simplicity in this test)
     let doc = create_test_document(1, "hello world from squidex");
-    state_machine.index_document(doc)?;
+    state_machine.apply_parsed_command(1, Command::IndexDocument(doc))?;
+    state_machine.wait_for_index(1, 1000)?;
 
     // Verify document was indexed
     assert_eq!(state_machine.total_documents(), 1);
@@ -68,24 +70,29 @@ async fn test_single_node_operations() -> Result<(), Box<dyn std::error::Error>>
 async fn test_snapshot_and_restore() -> Result<(), Box<dyn std::error::Error>> {
     let _temp_dir = TempDir::new()?;
 
+    let temp_dir = TempDir::new()?;
     let settings = create_test_settings();
-    let state_machine = Arc::new(SearchStateMachine::new(settings));
+    let state_machine =
+        Arc::new(SearchStateMachine::new(settings, temp_dir.path().to_path_buf())?);
 
     // Index some documents
     for i in 1..=10 {
         let doc = create_test_document(i, &format!("test document {}", i));
-        state_machine.index_document(doc)?;
+        state_machine.apply_parsed_command(i as u64, Command::IndexDocument(doc))?;
     }
 
     assert_eq!(state_machine.total_documents(), 10);
+    state_machine.wait_for_index(10, 5_000)?;
 
     // Create a snapshot
     let snapshot = state_machine.create_snapshot();
     assert!(!snapshot.is_empty());
 
     // Create a new state machine and restore
+    let temp_dir2 = TempDir::new()?;
     let settings2 = create_test_settings();
-    let state_machine2 = Arc::new(SearchStateMachine::new(settings2));
+    let state_machine2 =
+        Arc::new(SearchStateMachine::new(settings2, temp_dir2.path().to_path_buf())?);
 
     state_machine2.restore_snapshot(&snapshot)?;
 
@@ -101,8 +108,10 @@ async fn test_snapshot_and_restore() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_vector_and_hybrid_search() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = TempDir::new()?;
     let settings = create_test_settings();
-    let state_machine = Arc::new(SearchStateMachine::new(settings));
+    let state_machine =
+        Arc::new(SearchStateMachine::new(settings, temp_dir.path().to_path_buf())?);
 
     // Index documents with different embeddings
     let docs = vec![
@@ -120,8 +129,9 @@ async fn test_vector_and_hybrid_search() -> Result<(), Box<dyn std::error::Error
             created_at: 0,
             updated_at: 0,
         };
-        state_machine.index_document(doc)?;
+        state_machine.apply_parsed_command(id, Command::IndexDocument(doc))?;
     }
+    state_machine.wait_for_index(3, 5_000)?;
 
     // Test keyword search
     let keyword_results = state_machine.keyword_search("rust", 10);

@@ -22,6 +22,7 @@ mod writer;
 mod manifest;
 mod index;
 mod merge;
+mod store;
 
 pub use types::*;
 pub use statistics::*;
@@ -35,3 +36,4 @@ pub use writer::*;
 pub use manifest::*;
 pub use index::*;
 pub use merge::*;
+pub use store::*;

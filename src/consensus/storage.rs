@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::types::{LogEntry, NodeId, Response, SquidexSnapshot, TypeConfig};
 use crate::error::SquidexError;
 use crate::state_machine::SearchStateMachine;
+use crate::models::Command;
 
 /// State machine state for persistence
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -395,37 +396,18 @@ impl SquidexStateMachine {
     }
 
     /// Apply a log entry to the search state machine
-    fn apply_entry(&self, entry: &LogEntry) -> Response {
-        match entry {
-            LogEntry::IndexDocument(doc) => match self.search_machine.index_document(doc.clone()) {
-                Ok(_) => Response::success(format!("indexed doc {}", doc.id)),
-                Err(e) => Response::error(format!("failed to index: {}", e)),
-            },
-            LogEntry::DeleteDocument(doc_id) => {
-                match self.search_machine.delete_document(*doc_id) {
-                    Ok(_) => Response::success(format!("deleted doc {}", doc_id)),
-                    Err(e) => Response::error(format!("failed to delete: {}", e)),
-                }
-            }
-            LogEntry::BatchIndex(docs) => {
-                let mut indexed = 0;
-                for doc in docs {
-                    if self.search_machine.index_document(doc.clone()).is_ok() {
-                        indexed += 1;
-                    }
-                }
-                Response::success(format!("batch indexed {} docs", indexed))
-            }
-            LogEntry::BatchDelete(doc_ids) => {
-                let mut deleted = 0;
-                for doc_id in doc_ids {
-                    if self.search_machine.delete_document(*doc_id).is_ok() {
-                        deleted += 1;
-                    }
-                }
-                Response::success(format!("batch deleted {} docs", deleted))
-            }
-            LogEntry::UpdateConfig(_settings) => Response::success("config updated"),
+    fn apply_entry(&self, log_index: u64, entry: &LogEntry) -> Response {
+        let cmd = match entry {
+            LogEntry::IndexDocument(doc) => Command::IndexDocument(doc.clone()),
+            LogEntry::DeleteDocument(doc_id) => Command::DeleteDocument(*doc_id),
+            LogEntry::BatchIndex(docs) => Command::BatchIndex(docs.clone()),
+            LogEntry::BatchDelete(doc_ids) => Command::BatchDelete(doc_ids.clone()),
+            LogEntry::UpdateConfig(settings) => Command::UpdateSettings(settings.clone()),
+        };
+
+        match self.search_machine.apply_parsed_command(log_index, cmd) {
+            Ok(_) => Response::success("ok"),
+            Err(e) => Response::error(format!("apply failed: {}", e)),
         }
     }
 }
@@ -491,7 +473,7 @@ impl RaftStateMachine<TypeConfig> for SquidexStateMachine {
 
             match entry.payload {
                 EntryPayload::Normal(ref request) => {
-                    let response = self.apply_entry(&request.entry);
+                    let response = self.apply_entry(entry.log_id.index, &request.entry);
                     responses.push(response);
                 }
                 EntryPayload::Membership(ref membership) => {

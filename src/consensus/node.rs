@@ -145,7 +145,9 @@ impl SquidexNode {
             .await
             .map_err(|e| SquidexError::Consensus(format!("{:?}", e)))?;
 
-        Ok(response.data)
+        let mut data = response.data;
+        data.commit_index = Some(response.log_id.index);
+        Ok(data)
     }
 
     /// Check if this node is the leader

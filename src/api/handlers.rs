@@ -71,6 +71,8 @@ pub async fn index_document(
     }
 
     let doc_id = state.state_machine.next_document_id();
+    let refresh = req.refresh.unwrap_or_else(|| "none".to_string());
+    let timeout_ms = req.timeout_ms.unwrap_or(5_000);
 
     let doc = Document {
         id: doc_id,
@@ -83,13 +85,27 @@ pub async fn index_document(
 
     let entry = LogEntry::IndexDocument(doc);
 
-    state
+    let resp = state
         .node
         .propose(entry)
         .await
         .map_err(|e| SquidexError::Consensus(e.to_string()))?;
+    let commit_index = resp.commit_index.unwrap_or(0);
 
-    Ok((StatusCode::CREATED, Json(IndexResponse { id: doc_id })))
+    if refresh.eq_ignore_ascii_case("wait_for") && commit_index > 0 {
+        state
+            .state_machine
+            .wait_for_index(commit_index, timeout_ms)
+            .map_err(ApiError::Squidex)?;
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(IndexResponse {
+            id: doc_id,
+            commit_index,
+        }),
+    ))
 }
 
 /// Get a document by ID
@@ -130,6 +146,22 @@ pub async fn search(
     Json(req): Json<SearchRequestApi>,
 ) -> Result<impl IntoResponse, ApiError> {
     let start = std::time::Instant::now();
+
+    if let Some(min_applied) = req.min_index_applied_index {
+        let wait_ms = req.wait_for.unwrap_or(0);
+        if state.state_machine.index_version() < min_applied {
+            if wait_ms > 0 {
+                state
+                    .state_machine
+                    .wait_for_index(min_applied, wait_ms)
+                    .map_err(ApiError::Squidex)?;
+            } else {
+                return Err(ApiError::Squidex(SquidexError::SearchError(
+                    "index_not_ready".to_string(),
+                )));
+            }
+        }
+    }
 
     let results = match req.mode {
         SearchModeApi::Keyword => {
@@ -176,9 +208,18 @@ pub async fn batch_index(
         return Err(ApiError::NotLeader);
     }
 
+    let mut refresh_wait_for = false;
+    let mut timeout_ms = 5_000u64;
+
     let documents: Vec<Document> = requests
         .into_iter()
         .map(|req| {
+            if req.refresh.as_deref() == Some("wait_for") {
+                refresh_wait_for = true;
+            }
+            if let Some(t) = req.timeout_ms {
+                timeout_ms = t;
+            }
             let doc_id = state.state_machine.next_document_id();
             Document {
                 id: doc_id,
@@ -193,11 +234,19 @@ pub async fn batch_index(
 
     let entry = LogEntry::BatchIndex(documents);
 
-    state
+    let resp = state
         .node
         .propose(entry)
         .await
         .map_err(|e| SquidexError::Consensus(e.to_string()))?;
+    let commit_index = resp.commit_index.unwrap_or(0);
+
+    if refresh_wait_for && commit_index > 0 {
+        state
+            .state_machine
+            .wait_for_index(commit_index, timeout_ms)
+            .map_err(ApiError::Squidex)?;
+    }
 
     Ok(StatusCode::CREATED)
 }

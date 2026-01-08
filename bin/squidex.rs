@@ -105,7 +105,10 @@ async fn main() -> Result<()> {
     );
 
     // Create state machine
-    let state_machine = Arc::new(SearchStateMachine::new(index_settings));
+    let state_machine = Arc::new(SearchStateMachine::new(
+        index_settings,
+        node_config.data_dir.clone(),
+    )?);
     info!("Search state machine initialized");
 
     // Create Squidex node (OpenRaft-based)

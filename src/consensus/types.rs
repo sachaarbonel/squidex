@@ -68,6 +68,7 @@ impl Request {
 pub struct Response {
     pub success: bool,
     pub message: Option<String>,
+    pub commit_index: Option<u64>,
 }
 
 impl Response {
@@ -75,6 +76,7 @@ impl Response {
         Self {
             success: true,
             message: Some(message.into()),
+            commit_index: None,
         }
     }
 
@@ -82,6 +84,7 @@ impl Response {
         Self {
             success: false,
             message: Some(message.into()),
+            commit_index: None,
         }
     }
 }

@@ -66,6 +66,7 @@ num_cpus = "1.16"
 chrono = "0.4"
 clap = { version = "4.4", features = ["derive", "env"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
+crc32fast = "1.4"
 
 # Segment-based index
 fst = "0.4"
