@@ -1,461 +1,217 @@
 # Squidex
 
-A production-ready **distributed keyword & vector search engine** built with Rust, OpenRaft, and gRPC.
+Squidex is a Rust search engine that combines BM25 keyword search with vector similarity search and exposes an HTTP API. It uses OpenRaft for replicated state and gRPC for Raft RPCs.
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![Tests](https://img.shields.io/badge/tests-34%20passing-success)]()
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)]()
+## What is implemented
 
-## Features
+- **Keyword search**: BM25 scoring with \(K1 = 1.2\) and \(B = 0.75\) (see `src/state_machine/scoring.rs`).
+- **Vector search**: Cosine, Euclidean, and dot product scoring with a Product Quantization backed vector store (see `src/state_machine/machine.rs` and `src/vector/`).
+- **Hybrid search**: Combines keyword and vector scores with a configurable keyword weight (see `src/state_machine/machine.rs`).
+- **HTTP API**: Document indexing, retrieval, search, cluster status, health, and Prometheus metrics (see `src/api/router.rs`).
 
-### Search Capabilities
-- **Keyword Search** - Full-text search with BM25 ranking algorithm
-- **Vector Search** - Semantic similarity using embedding vectors
-- **Hybrid Search** - Combined keyword + vector ranking with configurable weights
-- **Metadata Filtering** - Filter by tags, source, date range, or custom fields
+## Requirements
 
-### Distributed Systems
-- **Raft Consensus** - Strong consistency via OpenRaft
-- **gRPC Transport** - Efficient, encrypted peer-to-peer communication
-- **Automatic Failover** - Leader election and replication across 3-7 nodes
-- **Snapshot & Recovery** - Durable persistence with automatic recovery
+- **Rust**: 1.91+ (see `Cargo.toml` `rust-version`).
+- **Protocol Buffers compiler**: `protoc` is required to build because `build.rs` compiles `proto/raft.proto` via `tonic-build`.
 
-### Performance
-- **Configurable Profiles** - Low-latency, balanced, high-throughput, and durable modes
-- **Batch Operations** - Efficient bulk indexing and deletion
-- **Concurrent Access** - Lock-free reads with RwLock-based state management
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Client Layer                          │
-│  REST API (8080) │ gRPC │ SDK │ CLI                          │
-└──────────────────────────┬───────────────────────────────────┘
-                           │
-              ┌────────────┴─────────────┐
-              │     Load Balancer        │
-              │  (Leader Discovery)      │
-              └────────────┬─────────────┘
-                           │
-        ┌──────────────────┼──────────────────┐
-        │                  │                  │
-        ▼                  ▼                  ▼
-   ┌────────┐         ┌────────┐         ┌────────┐
-   │ Node 1 │ ◄────► │ Node 2 │ ◄────► │ Node 3 │
-   │(LEADER)│  gRPC   │(FOLLOW)│  gRPC   │(FOLLOW)│
-   │ :5001  │         │ :5001  │         │ :5001  │
-   └────────┘         └────────┘         └────────┘
-```
-
-Each node contains:
-- **SearchStateMachine** - Core search logic
-- **Inverted Index** - Term → Document mapping
-- **Vector Store** - Embedding storage
-- **Metadata Indices** - Tag, source, date indices
-- **OpenRaft** - Consensus layer
-- **gRPC Service** - Inter-node communication (port 5001)
-- **HTTP API** - Client interface (port 8080)
-
-## Quick Start
-
-### Installation
+Install `protoc`:
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/squidex.git
-cd squidex
+# macOS
+brew install protobuf
 
-# Build the project
+# Debian/Ubuntu
+sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+protoc --version
+```
+
+## Build
+
+```bash
+git clone https://github.com/sachaarbonel/squidex.git
+cd squidex
 cargo build --release
 ```
 
-### Running a Single Node
+## Run (single node)
+
+Writes are accepted only on the leader. A single node becomes leader when started with `--is-initial-leader`.
+
+This example uses `--vector-dimensions 24` so the HTTP examples can use short embeddings. The value must be divisible by the default PQ subspace count (24).
 
 ```bash
 cargo run --release -- \
   --node-id 1 \
   --bind-addr 127.0.0.1:5001 \
-  --http-addr 127.0.0.1:8080 \
-  --data-dir ./data/node1 \
+  --http-port 8080 \
+  --data-dir ./data \
   --is-initial-leader \
   --profile balanced \
-  --vector-dimensions 384
-```
-
-### Running a 3-Node Cluster
-
-**Node 1 (Initial Leader)**:
-```bash
-cargo run --release -- \
-  --node-id 1 \
-  --bind-addr 10.0.0.1:5001 \
-  --http-addr 10.0.0.1:8080 \
-  --peers 10.0.0.2:5001,10.0.0.3:5001 \
-  --data-dir /data/node1 \
-  --is-initial-leader
-```
-
-**Node 2**:
-```bash
-cargo run --release -- \
-  --node-id 2 \
-  --bind-addr 10.0.0.2:5001 \
-  --http-addr 10.0.0.2:8080 \
-  --peers 10.0.0.1:5001,10.0.0.3:5001 \
-  --data-dir /data/node2
-```
-
-**Node 3**:
-```bash
-cargo run --release -- \
-  --node-id 3 \
-  --bind-addr 10.0.0.3:5001 \
-  --http-addr 10.0.0.3:8080 \
-  --peers 10.0.0.1:5001,10.0.0.2:5001 \
-  --data-dir /data/node3
+  --vector-dimensions 24
 ```
 
 ## HTTP API
 
-### Index a Document
+All API routes (except `/health` and `/metrics`) are under the `/v1` prefix.
+
+### Index a document
+
+The server assigns a numeric document ID and returns it in the response.
 
 ```bash
-curl -X POST http://localhost:8080/documents \
+curl -sS -X POST "http://localhost:8080/v1/documents" \
   -H "Content-Type: application/json" \
   -d '{
-    "id": 1,
-    "content": "Rust is a systems programming language",
-    "embedding": [0.1, 0.2, 0.3],
+    "content": "Rust is a systems programming language focused on safety and concurrency.",
+    "embedding": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24],
     "metadata": {
       "title": "About Rust",
-      "tags": ["programming", "rust"]
+      "source": "example",
+      "tags": ["rust", "systems"],
+      "custom": {"author": "squidex"}
     }
   }'
 ```
 
-### Keyword Search
+### Get a document
 
 ```bash
-curl "http://localhost:8080/search?q=rust+programming&limit=10"
+curl -sS "http://localhost:8080/v1/documents/1"
 ```
 
-### Vector Search
+### Search (keyword)
 
 ```bash
-curl -X POST http://localhost:8080/search/vector \
+curl -sS -X POST "http://localhost:8080/v1/search" \
   -H "Content-Type: application/json" \
   -d '{
-    "embedding": [0.1, 0.2, 0.3],
-    "limit": 10
+    "mode": "keyword",
+    "query": "safety concurrency",
+    "top_k": 10
   }'
 ```
 
-### Hybrid Search
+### Search (vector)
 
 ```bash
-curl -X POST http://localhost:8080/search/hybrid \
+curl -sS -X POST "http://localhost:8080/v1/search" \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "rust programming",
-    "embedding": [0.1, 0.2, 0.3],
-    "limit": 10,
-    "keyword_weight": 0.5
+    "mode": "vector",
+    "embedding": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24],
+    "top_k": 10
   }'
 ```
 
-### Cluster Status
+### Search (hybrid)
 
 ```bash
-curl http://localhost:8080/cluster/status
+curl -sS -X POST "http://localhost:8080/v1/search" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "mode": "hybrid",
+    "query": "rust safety",
+    "embedding": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24],
+    "keyword_weight": 0.5,
+    "top_k": 10
+  }'
 ```
 
-## Rust SDK Usage
+### Cluster status
 
-### Indexing Documents
-
-```rust
-use squidex::{SearchStateMachine, IndexSettings, Document, DocumentMetadata};
-
-// Create state machine
-let settings = IndexSettings::default();
-let machine = SearchStateMachine::new(settings);
-
-// Create a document
-let doc = Document {
-    id: 1,
-    content: "Rust is a systems programming language".to_string(),
-    embedding: vec![0.1, 0.2, 0.3], // Match your vector dimensions
-    metadata: DocumentMetadata {
-        title: Some("About Rust".to_string()),
-        tags: vec!["programming".to_string(), "rust".to_string()],
-        ..Default::default()
-    },
-    created_at: 1234567890,
-    updated_at: 1234567890,
-};
-
-// Index the document
-machine.index_document(doc)?;
+```bash
+curl -sS "http://localhost:8080/v1/cluster/status"
 ```
 
-### Keyword Search
+## Health and metrics
 
-```rust
-// BM25-based keyword search
-let results = machine.keyword_search("rust programming", 10);
-
-for result in results {
-    println!("Doc ID: {}, Score: {}", result.doc_id, result.score);
-}
+```bash
+curl -sS "http://localhost:8080/health"
+curl -sS "http://localhost:8080/metrics"
 ```
 
-### Vector Search
+The Prometheus registry includes (at least) these metrics (see `src/metrics/mod.rs`):
 
-```rust
-// Similarity search with embedding
-let query_embedding = vec![0.1, 0.2, 0.3];
-let results = machine.vector_search(&query_embedding, 10);
-```
+- `squidex_documents_indexed_total`
+- `squidex_documents_deleted_total`
+- `squidex_documents_updated_total`
+- `squidex_searches_total`
+- `squidex_search_errors_total`
+- `squidex_total_documents`
+- `squidex_index_size_bytes`
+- `squidex_cluster_leader`
+- `squidex_cluster_size`
+- `squidex_index_latency_seconds`
+- `squidex_search_latency_seconds`
+- `squidex_batch_size`
 
-### Hybrid Search
-
-```rust
-// Combined keyword + vector search
-let results = machine.hybrid_search(
-    "rust programming",
-    &query_embedding,
-    10,
-    0.5  // 50% keyword weight, 50% vector weight
-);
-```
+Note: the API handlers do not currently record metrics; only the endpoint and registry are implemented.
 
 ## Configuration
 
-### Performance Profiles
+### CLI flags and environment variables
 
-Choose a profile based on your workload:
+The CLI is implemented in `bin/squidex.rs` with `clap`. These flags can also be set via environment variables:
 
-| Profile | Batch Size | Flush Interval | Use Case |
-|---------|------------|----------------|----------|
-| **Low Latency** | 10 | 10ms | Real-time search |
-| **Balanced** | 100 | 50ms | General purpose (default) |
-| **High Throughput** | 1,000 | 200ms | Bulk indexing |
-| **Durable** | 1 | 0ms | Financial/audit logs |
+| Environment variable | Flag | Default |
+|---|---|---|
+| `SQUIDEX_NODE_ID` | `--node-id` | required |
+| `SQUIDEX_BIND_ADDR` | `--bind-addr` | `127.0.0.1:5001` |
+| `SQUIDEX_PEERS` | `--peers` | empty |
+| `SQUIDEX_DATA_DIR` | `--data-dir` | `./data` |
+| `SQUIDEX_INITIAL_LEADER` | `--is-initial-leader` | `false` |
+| `SQUIDEX_PROFILE` | `--profile` | `balanced` |
+| `SQUIDEX_VECTOR_DIM` | `--vector-dimensions` | `384` |
+| `SQUIDEX_HTTP_PORT` | `--http-port` | `8080` |
 
-```bash
-cargo run -- --profile low-latency  # or balanced, high-throughput, durable
-```
+### Performance profiles
 
-### Index Settings
+Performance profiles are applied to the Raft node WAL settings (see `src/config.rs`):
 
-Configure vector dimensions and similarity metrics:
+| Profile | WAL batch size | WAL flush interval (ms) |
+|---|---:|---:|
+| `low-latency` | 10 | 10 |
+| `balanced` | 100 | 50 |
+| `high-throughput` | 1000 | 200 |
+| `durable` | 1 | 0 |
 
-```rust
-use squidex::{IndexSettings, SimilarityMetric, TokenizerConfig};
+### Vector dimension constraint
 
-let settings = IndexSettings {
-    vector_dimensions: 768,  // e.g., for sentence-transformers
-    similarity_metric: SimilarityMetric::Cosine,
-    tokenizer_config: TokenizerConfig {
-        lowercase: true,
-        remove_stopwords: true,
-        stem: true,
-        min_token_length: 2,
-        max_token_length: 50,
-        language: "english".to_string(),
-    },
-};
-```
+The vector store uses Product Quantization by default. The configured vector dimensions must be divisible by the PQ subspace count (default is 24 in `src/config.rs`). If you change `--vector-dimensions`, keep it a multiple of 24.
 
-## CLI Options
+## Known limitations (verified in code)
 
-```
-Usage: squidex [OPTIONS]
+- **Filters are not applied by the HTTP API**: `SearchRequestApi` includes a `filters` field, but `src/api/handlers.rs` does not use it when executing searches.
+- **Multi-node membership management is not exposed over HTTP**: `SquidexNode` has `add_node` and `remove_node` methods (see `src/consensus/node.rs`), but there are no HTTP routes for them in `src/api/router.rs`.
+- **Raft RPC TLS is not configured**: The gRPC server is started with `tonic::transport::Server::builder().serve(...)` without TLS configuration (see `bin/squidex.rs`).
 
-Options:
-  --node-id <NODE_ID>
-          Node ID (must be unique in cluster)
-          [env: SQUIDEX_NODE_ID]
+## Troubleshooting
 
-  --bind-addr <BIND_ADDR>
-          gRPC bind address for Raft communication
-          [env: SQUIDEX_BIND_ADDR]
-          [default: 127.0.0.1:5001]
+### Build fails with `protoc` not found
 
-  --http-addr <HTTP_ADDR>
-          HTTP API bind address
-          [env: SQUIDEX_HTTP_ADDR]
-          [default: 127.0.0.1:8080]
+- Install the Protocol Buffers compiler (see Requirements).
 
-  --peers <PEERS>
-          Comma-separated list of peer gRPC addresses
-          [env: SQUIDEX_PEERS]
+### Process panics when changing `--vector-dimensions`
 
-  --data-dir <DATA_DIR>
-          Data directory for logs and snapshots
-          [env: SQUIDEX_DATA_DIR]
-          [default: ./data]
+- The PQ store asserts that `vector_dimensions % num_subspaces == 0`. The default subspace count is 24. Use a multiple of 24 (24, 48, 96, 384, 768).
 
-  --is-initial-leader
-          Whether this node bootstraps the cluster
-          [env: SQUIDEX_INITIAL_LEADER]
+### Indexing returns `not_leader`
 
-  --profile <PROFILE>
-          Performance profile (low-latency, balanced, high-throughput, durable)
-          [env: SQUIDEX_PROFILE]
-          [default: balanced]
+- Write endpoints (`POST /v1/documents`, `DELETE /v1/documents/:id`, `POST /v1/batch/index`) require the node to be leader. Start a single node with `--is-initial-leader`.
 
-  --vector-dimensions <VECTOR_DIM>
-          Vector embedding dimensions
-          [env: SQUIDEX_VECTOR_DIM]
-          [default: 384]
+### Vector search returns no results
 
-  -h, --help
-          Print help
-```
+- If the query embedding length does not match the configured `--vector-dimensions`, `vector_search` returns an empty result set (see `src/state_machine/machine.rs`).
 
-## Architecture Details
-
-### BM25 Ranking
-
-Squidex uses the BM25 algorithm for keyword search with parameters:
-- `K1 = 1.2` - Term frequency saturation
-- `B = 0.75` - Length normalization
-
-```
-score = IDF(term) × (TF(term) × (K1 + 1)) / (TF(term) + K1 × (1 - B + B × (doc_len / avg_doc_len)))
-```
-
-### Vector Similarity Metrics
-
-Choose from three similarity metrics:
-
-- **Cosine Similarity**: `cos(θ) = (A · B) / (||A|| × ||B||)`
-- **Euclidean Distance**: `1 / (1 + ||A - B||)`
-- **Dot Product**: `A · B`
-
-### Tokenization Pipeline
-
-1. **Unicode Word Segmentation** - Split text into words
-2. **Lowercasing** - Normalize case
-3. **Stopword Removal** - Remove common words (optional)
-4. **Stemming** - Porter stemmer for English (optional)
-5. **Length Filtering** - Min/max token length
-
-### Raft Consensus
-
-Powered by [OpenRaft](https://github.com/datafuselabs/openraft):
-
-- **Leader Election** - Automatic leader election on startup and failures
-- **Log Replication** - Commands replicated to majority before committing
-- **Snapshots** - Periodic snapshots for fast recovery
-- **gRPC Transport** - Efficient binary protocol for inter-node communication
-
-## Testing
+## Development
 
 ```bash
-# Run all tests
 cargo test
-
-# Run with logging
-RUST_LOG=debug cargo test
-
-# Run specific test
-cargo test test_keyword_search
-
-# Run benchmarks (TODO)
-cargo bench
+cargo fmt --check
+cargo clippy -- -D warnings
 ```
-
-### Test Coverage
-
-- **31 unit tests** covering:
-  - Data model serialization
-  - Tokenization and stemming
-  - BM25 scoring
-  - Vector similarity
-  - State machine operations
-  - Snapshot/restore
-  - Search operations
-
-- **3 integration tests** covering:
-  - Single node operations
-  - Vector and hybrid search
-  - Snapshot and restore
-
-## Development Status
-
-### Completed
-- [x] Core data models (Document, Command, SearchRequest)
-- [x] Tokenizer with stemming and stopword removal
-- [x] BM25, cosine, euclidean, dot product scoring
-- [x] Inverted index for keyword search
-- [x] Vector store for similarity search
-- [x] Metadata indices (tags, source, date)
-- [x] SearchStateMachine
-- [x] Snapshot/restore functionality
-- [x] Configuration system with performance profiles
-- [x] CLI binary with argument parsing
-- [x] OpenRaft consensus integration
-- [x] gRPC inter-node communication
-- [x] HTTP REST API layer
-- [x] Comprehensive tests (34 tests passing)
-
-### Planned
-- [ ] Metrics and monitoring (Prometheus)
-- [ ] Health checks and readiness probes
-- [ ] Client SDKs (Rust, Python, Go)
-- [ ] Web UI dashboard
-- [ ] HNSW index for faster vector search
-- [ ] Sharding for horizontal scaling
-- [ ] Query DSL
-- [ ] TLS for gRPC
-
-## Performance
-
-Expected performance characteristics:
-
-- **Indexing**: 10K-100K docs/sec (depending on profile)
-- **Keyword Search**: < 10ms p99 for 100K documents
-- **Vector Search**: < 50ms p99 for 100K documents (brute-force)
-- **Hybrid Search**: < 60ms p99
-- **Snapshot Size**: ~1KB per document
-- **Memory Usage**: ~2KB per document
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
 ## License
 
-This project is dual-licensed under:
-- MIT License
-- Apache License 2.0
-
-Choose the license that best suits your project.
-
-## Acknowledgments
-
-- **[OpenRaft](https://github.com/datafuselabs/openraft)** - Rust Raft consensus implementation
-- **[Tonic](https://github.com/hyperium/tonic)** - gRPC framework for Rust
-- **[Axum](https://github.com/tokio-rs/axum)** - Web framework for Rust
-- **[Tantivy](https://github.com/quickwit-oss/tantivy)** - Inspiration for full-text search design
-- **[Qdrant](https://github.com/qdrant/qdrant)** - Inspiration for vector search design
-
-## References
-
-- [Raft Consensus Algorithm](https://raft.github.io/)
-- [BM25 Ranking Function](https://en.wikipedia.org/wiki/Okapi_BM25)
-- [Vector Similarity Search](https://www.pinecone.io/learn/vector-similarity/)
-- [OpenRaft Documentation](https://datafuselabs.github.io/openraft/)
-
----
-
-**Built with Rust**
+The crate is licensed as `MIT OR Apache-2.0` (see `Cargo.toml`).
