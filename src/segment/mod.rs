@@ -1,7 +1,7 @@
 //! Segment-based inverted index for full-text search
 //!
 //! This module implements immutable segment files with a mutable buffer
-//! for recent writes, following the SPEC.md design decisions.
+//! for recent writes.
 //!
 //! # Architecture
 //!

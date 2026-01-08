@@ -1,13 +1,80 @@
 # Squidex
 
-Squidex is a Rust search engine that combines BM25 keyword search with vector similarity search and exposes an HTTP API. It uses OpenRaft for replicated state and gRPC for Raft RPCs.
+![Rust](https://img.shields.io/badge/rust-1.91%2B-orange.svg)
+![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)
+
+Squidex is a Rust search engine that combines BM25 keyword search with vector similarity search and exposes an HTTP API. It uses OpenRaft for replicated state and gRPC for Raft RPCs. 
+
+## Features
+
+- **Hybrid search**: keyword + vector queries with configurable weighting.
+- **Vector search**: HNSW-based ANN with Product Quantization for memory efficiency.
+- **Distributed core**: OpenRaft replication with gRPC transport.
+- **Operational basics**: health checks and Prometheus metrics.
+- **Single-binary deploy**: no JVM or external services required.
+
+## Table of Contents
+
+- [Squidex](#squidex)
+  - [Features (SPEC v2.1 highlights)](#features-spec-v21-highlights)
+  - [Table of Contents](#table-of-contents)
+  - [What is implemented](#what-is-implemented)
+  - [Architecture](#architecture)
+  - [Requirements](#requirements)
+  - [Build](#build)
+  - [Run (single node)](#run-single-node)
+  - [HTTP API](#http-api)
+    - [Index a document](#index-a-document)
+    - [Get a document](#get-a-document)
+    - [Batch index documents](#batch-index-documents)
+    - [Delete a document](#delete-a-document)
+    - [Search (keyword)](#search-keyword)
+    - [Search (vector)](#search-vector)
+    - [Search (hybrid)](#search-hybrid)
+    - [Cluster status](#cluster-status)
+  - [Health and metrics](#health-and-metrics)
+  - [Configuration](#configuration)
+    - [CLI flags and environment variables](#cli-flags-and-environment-variables)
+    - [Performance profiles](#performance-profiles)
+    - [Vector dimension constraint](#vector-dimension-constraint)
+  - [Use cases](#use-cases)
+  - [Known limitations (verified in code)](#known-limitations-verified-in-code)
+  - [Troubleshooting](#troubleshooting)
+    - [Build fails with `protoc` not found](#build-fails-with-protoc-not-found)
+    - [Process panics when changing `--vector-dimensions`](#process-panics-when-changing---vector-dimensions)
+    - [Indexing returns `not_leader`](#indexing-returns-not_leader)
+    - [Vector search returns no results](#vector-search-returns-no-results)
+  - [Development](#development)
+  - [Contributing](#contributing)
+  - [License](#license)
 
 ## What is implemented
 
 - **Keyword search**: BM25 scoring with \(K1 = 1.2\) and \(B = 0.75\) (see `src/state_machine/scoring.rs`).
-- **Vector search**: Cosine, Euclidean, and dot product scoring with a Product Quantization backed vector store (see `src/state_machine/machine.rs` and `src/vector/`).
+- **Vector search**: Cosine, Euclidean, and dot product scoring with an HNSW index and Product Quantization backed vector store (see `src/state_machine/machine.rs` and `src/vector/`).
 - **Hybrid search**: Combines keyword and vector scores with a configurable keyword weight (see `src/state_machine/machine.rs`).
 - **HTTP API**: Document indexing, retrieval, search, cluster status, health, and Prometheus metrics (see `src/api/router.rs`).
+
+## Architecture
+
+At a high level:
+
+- **Consensus**: OpenRaft for replicated state and membership.
+- **API**: HTTP via Axum; Raft RPCs via gRPC/tonic.
+- **Search**: BM25 keyword search + vector search, fused for hybrid ranking.
+- **Storage**: append-only logs + RocksDB metadata, with PQ-compressed vectors.
+
+Directory structure (partial):
+
+```
+src/
+├── api/          # HTTP API handlers and routing
+├── consensus/    # Raft node and cluster management
+├── state_machine/# Search engine state machine
+├── vector/       # Vector storage (PQ + HNSW)
+├── metrics/      # Prometheus metrics
+└── config.rs     # Configuration and profiles
+```
 
 ## Requirements
 
@@ -78,6 +145,31 @@ curl -sS -X POST "http://localhost:8080/v1/documents" \
 
 ```bash
 curl -sS "http://localhost:8080/v1/documents/1"
+```
+
+### Batch index documents
+
+```bash
+curl -sS -X POST "http://localhost:8080/v1/batch/index" \
+  -H "Content-Type: application/json" \
+  -d '[
+    {
+      "content": "Document 1",
+      "embedding": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18, 0.19, 0.20, 0.21, 0.22, 0.23, 0.24],
+      "metadata": {"title": "Doc 1"}
+    },
+    {
+      "content": "Document 2",
+      "embedding": [0.24, 0.23, 0.22, 0.21, 0.20, 0.19, 0.18, 0.17, 0.16, 0.15, 0.14, 0.13, 0.12, 0.11, 0.10, 0.09, 0.08, 0.07, 0.06, 0.05, 0.04, 0.03, 0.02, 0.01],
+      "metadata": {"title": "Doc 2"}
+    }
+  ]'
+```
+
+### Delete a document
+
+```bash
+curl -sS -X DELETE "http://localhost:8080/v1/documents/1"
 ```
 
 ### Search (keyword)
@@ -180,11 +272,19 @@ Performance profiles are applied to the Raft node WAL settings (see `src/config.
 
 The vector store uses Product Quantization by default. The configured vector dimensions must be divisible by the PQ subspace count (default is 24 in `src/config.rs`). If you change `--vector-dimensions`, keep it a multiple of 24.
 
+## Use cases
+
+- **Semantic search**: combine keyword and embedding-based retrieval.
+- **Document search**: full-text + vector similarity in one index.
+- **RAG pipelines**: retrieval layer for LLM applications.
+- **Distributed search**: replicated nodes for availability.
+
 ## Known limitations (verified in code)
 
 - **Filters are not applied by the HTTP API**: `SearchRequestApi` includes a `filters` field, but `src/api/handlers.rs` does not use it when executing searches.
 - **Multi-node membership management is not exposed over HTTP**: `SquidexNode` has `add_node` and `remove_node` methods (see `src/consensus/node.rs`), but there are no HTTP routes for them in `src/api/router.rs`.
 - **Raft RPC TLS is not configured**: The gRPC server is started with `tonic::transport::Server::builder().serve(...)` without TLS configuration (see `bin/squidex.rs`).
+- **Authentication and authorization are not implemented**: the HTTP API does not enforce auth.
 
 ## Troubleshooting
 
@@ -211,6 +311,18 @@ cargo test
 cargo fmt --check
 cargo clippy -- -D warnings
 ```
+
+## Contributing
+
+Contributions are welcome.
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Make your changes
+4. Run the checks (see Development)
+5. Commit your changes (`git commit -m "Add amazing feature"`)
+6. Push to the branch (`git push origin feature/amazing-feature`)
+7. Open a Pull Request
 
 ## License
 
