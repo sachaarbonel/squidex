@@ -16,7 +16,6 @@ Squidex is a Rust search engine that combines BM25 keyword search with vector si
 ## Table of Contents
 
 - [Squidex](#squidex)
-  - [Features (SPEC v2.1 highlights)](#features-spec-v21-highlights)
   - [Table of Contents](#table-of-contents)
   - [What is implemented](#what-is-implemented)
   - [Architecture](#architecture)
