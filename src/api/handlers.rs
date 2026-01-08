@@ -42,6 +42,8 @@ impl IntoResponse for ApiError {
                     SquidexError::InvalidRequest(_) => "invalid_request",
                     SquidexError::SearchError(_) => "search_error",
                     SquidexError::Internal(_) => "internal_error",
+                    SquidexError::VectorNotFound(_) => "vector_not_found",
+                    SquidexError::VectorStoreNotTrained => "vector_store_not_trained",
                 };
                 (StatusCode::BAD_REQUEST, error_type, e.to_string())
             }

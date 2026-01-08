@@ -2,6 +2,16 @@ use squidex::{Document, DocumentMetadata, IndexSettings, NodeConfig, SearchState
 use std::sync::Arc;
 use tempfile::TempDir;
 
+/// Create test settings with proper PQ configuration for 3-dimensional vectors
+fn create_test_settings() -> IndexSettings {
+    let mut settings = IndexSettings::default();
+    settings.vector_dimensions = 3;
+    // PQ requires dimensions to be divisible by num_subspaces
+    settings.pq_config.num_subspaces = 3;
+    settings.pq_config.min_training_vectors = 100; // Don't trigger auto-training in tests
+    settings
+}
+
 /// Create a test document
 fn create_test_document(id: u64, content: &str) -> Document {
     Document {
@@ -18,8 +28,7 @@ fn create_test_document(id: u64, content: &str) -> Document {
 async fn test_single_node_operations() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
 
-    let mut settings = IndexSettings::default();
-    settings.vector_dimensions = 3;
+    let settings = create_test_settings();
     let state_machine = Arc::new(SearchStateMachine::new(settings));
 
     let config = NodeConfig::new(
@@ -57,8 +66,7 @@ async fn test_single_node_operations() -> Result<(), Box<dyn std::error::Error>>
 async fn test_snapshot_and_restore() -> Result<(), Box<dyn std::error::Error>> {
     let _temp_dir = TempDir::new()?;
 
-    let mut settings = IndexSettings::default();
-    settings.vector_dimensions = 3;
+    let settings = create_test_settings();
     let state_machine = Arc::new(SearchStateMachine::new(settings));
 
     // Index some documents
@@ -74,8 +82,7 @@ async fn test_snapshot_and_restore() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!snapshot.is_empty());
 
     // Create a new state machine and restore
-    let mut settings2 = IndexSettings::default();
-    settings2.vector_dimensions = 3;
+    let settings2 = create_test_settings();
     let state_machine2 = Arc::new(SearchStateMachine::new(settings2));
 
     state_machine2.restore_snapshot(&snapshot)?;
@@ -92,8 +99,7 @@ async fn test_snapshot_and_restore() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn test_vector_and_hybrid_search() -> Result<(), Box<dyn std::error::Error>> {
-    let mut settings = IndexSettings::default();
-    settings.vector_dimensions = 3;
+    let settings = create_test_settings();
     let state_machine = Arc::new(SearchStateMachine::new(settings));
 
     // Index documents with different embeddings

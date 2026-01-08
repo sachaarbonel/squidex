@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 use crate::config::IndexSettings;
 use crate::error::{Result, SquidexError};
@@ -9,6 +9,7 @@ use crate::models::*;
 use crate::state_machine::scoring::*;
 use crate::state_machine::snapshot::{SearchSnapshot, SNAPSHOT_VERSION};
 use crate::tokenizer::Tokenizer;
+use crate::vector::QuantizedVectorStore;
 
 /// Production-ready distributed search state machine
 pub struct SearchStateMachine {
@@ -18,8 +19,8 @@ pub struct SearchStateMachine {
     // Inverted index for keyword search
     inverted_index: RwLock<HashMap<String, PostingList>>,
 
-    // Vector storage for similarity search
-    vector_store: RwLock<HashMap<DocumentId, Embedding>>,
+    // Vector storage for similarity search (Product Quantization)
+    vector_store: RwLock<QuantizedVectorStore>,
 
     // Metadata indices for filtering
     tag_index: RwLock<HashMap<String, HashSet<DocumentId>>>,
@@ -36,16 +37,31 @@ pub struct SearchStateMachine {
 
     // Tokenizer instance
     tokenizer: Tokenizer,
+
+    // Flag to track if PQ training is needed
+    pq_training_pending: AtomicBool,
 }
 
 impl SearchStateMachine {
     pub fn new(settings: IndexSettings) -> Self {
         let tokenizer = Tokenizer::new(&settings.tokenizer_config);
 
+        // Create the vector store with PQ configuration
+        let vector_store = if settings.pq_config.enabled {
+            QuantizedVectorStore::with_cache_size(
+                settings.vector_dimensions,
+                settings.pq_config.num_subspaces,
+                settings.pq_config.full_precision_cache_size,
+            )
+        } else {
+            // Use minimal subspaces when PQ is disabled (still uses the store but with buffering)
+            QuantizedVectorStore::new(settings.vector_dimensions, settings.pq_config.num_subspaces)
+        };
+
         Self {
             documents: RwLock::new(HashMap::new()),
             inverted_index: RwLock::new(HashMap::new()),
-            vector_store: RwLock::new(HashMap::new()),
+            vector_store: RwLock::new(vector_store),
             tag_index: RwLock::new(HashMap::new()),
             source_index: RwLock::new(HashMap::new()),
             date_index: RwLock::new(BTreeMap::new()),
@@ -54,6 +70,7 @@ impl SearchStateMachine {
             index_version: AtomicU64::new(0),
             settings: RwLock::new(settings),
             tokenizer,
+            pq_training_pending: AtomicBool::new(false),
         }
     }
 
@@ -69,6 +86,8 @@ impl SearchStateMachine {
                 actual: doc.embedding.len(),
             });
         }
+        let min_training_vectors = settings.pq_config.min_training_vectors;
+        let pq_enabled = settings.pq_config.enabled;
         drop(settings);
 
         // Tokenize content for inverted index
@@ -85,10 +104,16 @@ impl SearchStateMachine {
             }
         }
 
-        // Update vector store
-        self.vector_store
-            .write()
-            .insert(doc_id, doc.embedding.clone());
+        // Update vector store (with auto-training check)
+        {
+            let mut store = self.vector_store.write();
+            store.store(doc_id, &doc.embedding)?;
+
+            // Check if we should trigger auto-training
+            if pq_enabled && store.should_auto_train(min_training_vectors) {
+                self.pq_training_pending.store(true, Ordering::SeqCst);
+            }
+        }
 
         // Update metadata indices
         self.update_metadata_indices(&doc);
@@ -98,7 +123,21 @@ impl SearchStateMachine {
         self.total_documents.fetch_add(1, Ordering::SeqCst);
         self.index_version.fetch_add(1, Ordering::SeqCst);
 
+        // Trigger auto-training if pending (do this outside the lock)
+        if self.pq_training_pending.swap(false, Ordering::SeqCst) {
+            self.try_auto_train();
+        }
+
         Ok(doc_id)
+    }
+
+    /// Attempt to auto-train the PQ codebooks if conditions are met
+    fn try_auto_train(&self) {
+        let mut store = self.vector_store.write();
+        if let Err(e) = store.auto_train() {
+            // Log the error but don't fail the operation
+            tracing::warn!("PQ auto-training failed: {}", e);
+        }
     }
 
     /// Delete a document
@@ -125,7 +164,7 @@ impl SearchStateMachine {
         }
 
         // Remove from vector store
-        self.vector_store.write().remove(&doc_id);
+        self.vector_store.write().remove(doc_id);
 
         // Remove from metadata indices
         self.remove_from_metadata_indices(&doc);
@@ -204,7 +243,7 @@ impl SearchStateMachine {
         self.collect_top_k_results(scores, top_k)
     }
 
-    /// Vector similarity search
+    /// Vector similarity search using Product Quantization when available
     pub fn vector_search(&self, query_embedding: &[f32], top_k: usize) -> Vec<SearchResult> {
         let store = self.vector_store.read();
         let settings = self.settings.read();
@@ -213,13 +252,43 @@ impl SearchStateMachine {
             return Vec::new();
         }
 
-        let mut scores: Vec<(DocumentId, f32)> = store
+        // If store is trained, use ADC-based search
+        if store.is_trained() {
+            match store.search(query_embedding, top_k) {
+                Ok(results) => {
+                    // Convert distance to similarity score (inverse relationship)
+                    // Lower distance = higher similarity
+                    let max_dist = results.iter().map(|(_, d)| *d).fold(0.0f32, f32::max);
+                    let max_dist = if max_dist == 0.0 { 1.0 } else { max_dist };
+
+                    return results
+                        .into_iter()
+                        .map(|(doc_id, distance)| {
+                            // Convert distance to similarity score (1.0 = identical, 0.0 = max distance)
+                            let score = 1.0 - (distance / (max_dist + 1.0));
+                            SearchResult::new(doc_id, score)
+                        })
+                        .collect();
+                }
+                Err(e) => {
+                    tracing::warn!("PQ search failed, falling back to brute force: {}", e);
+                }
+            }
+        }
+
+        // Fallback: brute force search on documents (when PQ not trained)
+        // This uses the original embeddings stored in documents
+        let docs = self.documents.read();
+        let similarity_metric = settings.similarity_metric.clone();
+        drop(settings);
+
+        let mut scores: Vec<(DocumentId, f32)> = docs
             .iter()
-            .map(|(doc_id, embedding)| {
-                let score = match settings.similarity_metric {
-                    SimilarityMetric::Cosine => cosine_similarity(query_embedding, embedding),
-                    SimilarityMetric::Euclidean => euclidean_similarity(query_embedding, embedding),
-                    SimilarityMetric::DotProduct => dot_product(query_embedding, embedding),
+            .map(|(doc_id, doc)| {
+                let score = match similarity_metric {
+                    SimilarityMetric::Cosine => cosine_similarity(query_embedding, &doc.embedding),
+                    SimilarityMetric::Euclidean => euclidean_similarity(query_embedding, &doc.embedding),
+                    SimilarityMetric::DotProduct => dot_product(query_embedding, &doc.embedding),
                 };
                 (*doc_id, score)
             })
@@ -327,7 +396,7 @@ impl SearchStateMachine {
         // Shrink hash maps
         self.documents.write().shrink_to_fit();
         self.inverted_index.write().shrink_to_fit();
-        self.vector_store.write().shrink_to_fit();
+        // Note: QuantizedVectorStore uses compact storage by design (PQ)
 
         Ok(())
     }
@@ -448,10 +517,12 @@ impl SearchStateMachine {
 
     /// Create a complete snapshot of the search index
     pub fn create_snapshot(&self) -> Vec<u8> {
+        let vector_store_snapshot = self.vector_store.read().create_snapshot();
+
         let snapshot = SearchSnapshot::new(
             self.documents.read().clone(),
             self.inverted_index.read().clone(),
-            self.vector_store.read().clone(),
+            vector_store_snapshot,
             self.tag_index.read().clone(),
             self.source_index.read().clone(),
             self.date_index.read().clone(),
@@ -481,10 +552,19 @@ impl SearchStateMachine {
             });
         }
 
+        // Get cache size from settings
+        let cache_size = snapshot.settings.pq_config.full_precision_cache_size;
+
+        // Restore vector store from snapshot
+        let restored_vector_store = QuantizedVectorStore::restore_from_snapshot(
+            snapshot.vector_store,
+            cache_size,
+        );
+
         // Atomically restore all state
         *self.documents.write() = snapshot.documents;
         *self.inverted_index.write() = snapshot.inverted_index;
-        *self.vector_store.write() = snapshot.vector_store;
+        *self.vector_store.write() = restored_vector_store;
         *self.tag_index.write() = snapshot.tag_index;
         *self.source_index.write() = snapshot.source_index;
         *self.date_index.write() = snapshot.date_index;
@@ -628,15 +708,16 @@ mod tests {
 
     #[test]
     fn test_vector_search() {
-        let settings = IndexSettings::default();
-        let machine = SearchStateMachine::new(settings);
+        // Use 3 dimensions with 3 subspaces (1 dim per subspace) for testing
+        let mut settings = IndexSettings::default();
+        settings.vector_dimensions = 3;
+        settings.pq_config.num_subspaces = 3;
+        settings.pq_config.min_training_vectors = 10; // Won't trigger training with 3 docs
 
         let doc1 = create_test_document(1, "test doc 1", vec![1.0, 0.0, 0.0]);
         let doc2 = create_test_document(2, "test doc 2", vec![0.0, 1.0, 0.0]);
         let doc3 = create_test_document(3, "test doc 3", vec![0.9, 0.1, 0.0]);
 
-        let mut settings = IndexSettings::default();
-        settings.vector_dimensions = 3;
         let machine = SearchStateMachine::new(settings);
 
         machine.index_document(doc1).unwrap();

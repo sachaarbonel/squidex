@@ -9,6 +9,7 @@ pub struct IndexSettings {
     pub vector_dimensions: usize,
     pub similarity_metric: SimilarityMetric,
     pub tokenizer_config: TokenizerConfig,
+    pub pq_config: ProductQuantizationConfig,
 }
 
 impl Default for IndexSettings {
@@ -17,7 +18,48 @@ impl Default for IndexSettings {
             vector_dimensions: 384, // Default for many embedding models
             similarity_metric: SimilarityMetric::Cosine,
             tokenizer_config: TokenizerConfig::default(),
+            pq_config: ProductQuantizationConfig::default(),
         }
+    }
+}
+
+/// Product Quantization configuration for vector compression
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProductQuantizationConfig {
+    /// Number of subspaces for PQ (dimensions must be divisible by this)
+    pub num_subspaces: usize,
+    /// Minimum vectors required before training codebooks
+    pub min_training_vectors: usize,
+    /// Enable Product Quantization (if false, stores full-precision vectors)
+    pub enabled: bool,
+    /// Cache size for full-precision vectors
+    pub full_precision_cache_size: usize,
+}
+
+impl Default for ProductQuantizationConfig {
+    fn default() -> Self {
+        Self {
+            num_subspaces: 24,           // 384 / 24 = 16 dims per subspace
+            min_training_vectors: 1000,  // Train after 1000 vectors
+            enabled: true,
+            full_precision_cache_size: 10_000,
+        }
+    }
+}
+
+impl ProductQuantizationConfig {
+    /// Validate configuration against vector dimensions
+    pub fn validate(&self, dimensions: usize) -> Result<(), String> {
+        if self.num_subspaces == 0 {
+            return Err("num_subspaces must be positive".to_string());
+        }
+        if dimensions % self.num_subspaces != 0 {
+            return Err(format!(
+                "dimensions ({}) must be divisible by num_subspaces ({})",
+                dimensions, self.num_subspaces
+            ));
+        }
+        Ok(())
     }
 }
 

@@ -2,10 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::config::IndexSettings;
-use crate::models::{Document, DocumentId, Embedding, PostingList};
+use crate::models::{Document, DocumentId, PostingList};
+use crate::vector::VectorStoreSnapshot;
 
 /// Snapshot version for compatibility checking
-pub const SNAPSHOT_VERSION: u32 = 1;
+/// Bumped to v2 for QuantizedVectorStore integration
+pub const SNAPSHOT_VERSION: u32 = 2;
 
 /// Complete snapshot of the search state machine
 #[derive(Clone, Serialize, Deserialize)]
@@ -13,7 +15,7 @@ pub struct SearchSnapshot {
     pub version: u32,
     pub documents: HashMap<DocumentId, Document>,
     pub inverted_index: HashMap<String, PostingList>,
-    pub vector_store: HashMap<DocumentId, Embedding>,
+    pub vector_store: VectorStoreSnapshot,
     pub tag_index: HashMap<String, HashSet<DocumentId>>,
     pub source_index: HashMap<String, HashSet<DocumentId>>,
     pub date_index: BTreeMap<u64, HashSet<DocumentId>>,
@@ -28,7 +30,7 @@ impl SearchSnapshot {
     pub fn new(
         documents: HashMap<DocumentId, Document>,
         inverted_index: HashMap<String, PostingList>,
-        vector_store: HashMap<DocumentId, Embedding>,
+        vector_store: VectorStoreSnapshot,
         tag_index: HashMap<String, HashSet<DocumentId>>,
         source_index: HashMap<String, HashSet<DocumentId>>,
         date_index: BTreeMap<u64, HashSet<DocumentId>>,
@@ -70,10 +72,17 @@ impl SearchSnapshot {
     /// Get the size of this snapshot in bytes (approximate)
     pub fn estimated_size(&self) -> usize {
         // Rough estimation for monitoring
+        let quantized_size = self.vector_store.quantized_vectors.len()
+            * self.vector_store.num_subspaces; // 1 byte per subspace
+        let codebook_size = self.vector_store.num_subspaces * 256
+            * (self.vector_store.dimensions / self.vector_store.num_subspaces) * 4;
+        let buffer_size = self.vector_store.training_buffer.len()
+            * self.vector_store.dimensions * 4;
+
         std::mem::size_of::<Self>()
             + self.documents.len() * 1000 // Approximate per-document size
             + self.inverted_index.len() * 100 // Approximate per-term size
-            + self.vector_store.len() * self.settings.vector_dimensions * 4 // f32 = 4 bytes
+            + quantized_size + codebook_size + buffer_size
     }
 }
 
@@ -81,6 +90,17 @@ impl SearchSnapshot {
 mod tests {
     use super::*;
     use crate::models::DocumentMetadata;
+
+    fn create_empty_vector_store_snapshot() -> VectorStoreSnapshot {
+        VectorStoreSnapshot {
+            dimensions: 384,
+            num_subspaces: 24,
+            trained: false,
+            codebook_centroids: Vec::new(),
+            quantized_vectors: HashMap::new(),
+            training_buffer: Vec::new(),
+        }
+    }
 
     #[test]
     fn test_snapshot_serialization_roundtrip() {
@@ -90,7 +110,7 @@ mod tests {
             Document {
                 id: 1,
                 content: "test".to_string(),
-                embedding: vec![1.0, 2.0, 3.0],
+                embedding: vec![1.0; 384],
                 metadata: DocumentMetadata::default(),
                 created_at: 1000,
                 updated_at: 1000,
@@ -100,7 +120,7 @@ mod tests {
         let snapshot = SearchSnapshot::new(
             documents,
             HashMap::new(),
-            HashMap::new(),
+            create_empty_vector_store_snapshot(),
             HashMap::new(),
             HashMap::new(),
             BTreeMap::new(),
@@ -124,7 +144,7 @@ mod tests {
         let snapshot = SearchSnapshot::new(
             HashMap::new(),
             HashMap::new(),
-            HashMap::new(),
+            create_empty_vector_store_snapshot(),
             HashMap::new(),
             HashMap::new(),
             BTreeMap::new(),

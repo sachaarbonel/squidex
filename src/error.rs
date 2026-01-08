@@ -35,6 +35,12 @@ pub enum SquidexError {
 
     #[error("Search error: {0}")]
     SearchError(String),
+
+    #[error("Vector not found for document: {0}")]
+    VectorNotFound(u64),
+
+    #[error("Vector store not trained")]
+    VectorStoreNotTrained,
 }
 
 /// Result type alias for Squidex operations
