@@ -1,6 +1,6 @@
 //! Mutable buffer for in-memory writes
 //!
-//! Per SPEC: mutable buffers are sharded by `hash(doc_id)` to avoid a global lock.
+//! mutable buffers are sharded by `hash(doc_id)` to avoid a global lock.
 //! Flush merges shard-local builders into a segment.
 
 use std::collections::HashMap;
@@ -22,11 +22,11 @@ pub struct BufferConfig {
 impl Default for BufferConfig {
     fn default() -> Self {
         Self {
-            // Per SPEC: 256MB
+            // 256MB
             max_bytes: 256 * 1024 * 1024,
-            // Per SPEC: 50k docs
+            // 50k docs
             max_docs: 50_000,
-            // Per SPEC: 2s
+            // 2s
             flush_interval_secs: 2,
         }
     }

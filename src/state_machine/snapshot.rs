@@ -3,11 +3,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::config::IndexSettings;
 use crate::models::{Document, DocumentId, PostingList};
-use crate::vector::VectorStoreSnapshot;
+use crate::vector::HnswSnapshot;
 
 /// Snapshot version for compatibility checking
-/// Bumped to v2 for QuantizedVectorStore integration
-pub const SNAPSHOT_VERSION: u32 = 2;
+/// Bumped to v3 for HnswIndex integration
+pub const SNAPSHOT_VERSION: u32 = 3;
 
 /// Complete snapshot of the search state machine
 #[derive(Clone, Serialize, Deserialize)]
@@ -15,7 +15,7 @@ pub struct SearchSnapshot {
     pub version: u32,
     pub documents: HashMap<DocumentId, Document>,
     pub inverted_index: HashMap<String, PostingList>,
-    pub vector_store: VectorStoreSnapshot,
+    pub hnsw_index: HnswSnapshot,
     pub tag_index: HashMap<String, HashSet<DocumentId>>,
     pub source_index: HashMap<String, HashSet<DocumentId>>,
     pub date_index: BTreeMap<u64, HashSet<DocumentId>>,
@@ -30,7 +30,7 @@ impl SearchSnapshot {
     pub fn new(
         documents: HashMap<DocumentId, Document>,
         inverted_index: HashMap<String, PostingList>,
-        vector_store: VectorStoreSnapshot,
+        hnsw_index: HnswSnapshot,
         tag_index: HashMap<String, HashSet<DocumentId>>,
         source_index: HashMap<String, HashSet<DocumentId>>,
         date_index: BTreeMap<u64, HashSet<DocumentId>>,
@@ -43,7 +43,7 @@ impl SearchSnapshot {
             version: SNAPSHOT_VERSION,
             documents,
             inverted_index,
-            vector_store,
+            hnsw_index,
             tag_index,
             source_index,
             date_index,
@@ -72,19 +72,21 @@ impl SearchSnapshot {
     /// Get the size of this snapshot in bytes (approximate)
     pub fn estimated_size(&self) -> usize {
         // Rough estimation for monitoring
+        let vector_store = &self.hnsw_index.vector_store;
         let quantized_size =
-            self.vector_store.quantized_vectors.len() * self.vector_store.num_subspaces; // 1 byte per subspace
-        let codebook_size = self.vector_store.num_subspaces
+            vector_store.quantized_vectors.len() * vector_store.num_subspaces;
+        let codebook_size = vector_store.num_subspaces
             * 256
-            * (self.vector_store.dimensions / self.vector_store.num_subspaces)
+            * (vector_store.dimensions / vector_store.num_subspaces)
             * 4;
         let buffer_size =
-            self.vector_store.training_buffer.len() * self.vector_store.dimensions * 4;
+            vector_store.training_buffer.len() * vector_store.dimensions * 4;
+        let graph_size = self.hnsw_index.layers.len() * 1000; // Approximate per-layer
 
         std::mem::size_of::<Self>()
-            + self.documents.len() * 1000 // Approximate per-document size
-            + self.inverted_index.len() * 100 // Approximate per-term size
-            + quantized_size + codebook_size + buffer_size
+            + self.documents.len() * 1000
+            + self.inverted_index.len() * 100
+            + quantized_size + codebook_size + buffer_size + graph_size
     }
 }
 
@@ -92,15 +94,25 @@ impl SearchSnapshot {
 mod tests {
     use super::*;
     use crate::models::DocumentMetadata;
+    use crate::vector::{HnswParams, VectorStoreSnapshot};
 
-    fn create_empty_vector_store_snapshot() -> VectorStoreSnapshot {
-        VectorStoreSnapshot {
-            dimensions: 384,
-            num_subspaces: 24,
-            trained: false,
-            codebook_centroids: Vec::new(),
-            quantized_vectors: HashMap::new(),
-            training_buffer: Vec::new(),
+    fn create_empty_hnsw_snapshot() -> HnswSnapshot {
+        HnswSnapshot {
+            layers: Vec::new(),
+            entry_point: None,
+            max_layer: 0,
+            node_levels: HashMap::new(),
+            node_count: 0,
+            deleted: HashSet::new(),
+            vector_store: VectorStoreSnapshot {
+                dimensions: 384,
+                num_subspaces: 24,
+                trained: false,
+                codebook_centroids: Vec::new(),
+                quantized_vectors: HashMap::new(),
+                training_buffer: Vec::new(),
+            },
+            params: HnswParams::default(),
         }
     }
 
@@ -122,7 +134,7 @@ mod tests {
         let snapshot = SearchSnapshot::new(
             documents,
             HashMap::new(),
-            create_empty_vector_store_snapshot(),
+            create_empty_hnsw_snapshot(),
             HashMap::new(),
             HashMap::new(),
             BTreeMap::new(),
@@ -146,7 +158,7 @@ mod tests {
         let snapshot = SearchSnapshot::new(
             HashMap::new(),
             HashMap::new(),
-            create_empty_vector_store_snapshot(),
+            create_empty_hnsw_snapshot(),
             HashMap::new(),
             HashMap::new(),
             BTreeMap::new(),

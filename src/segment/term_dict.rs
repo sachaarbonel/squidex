@@ -1,6 +1,6 @@
 //! Term dictionary using FST (Finite State Transducer)
 //!
-//! Per SPEC: use an FST term dictionary with per-term offsets into postings.
+//! Use an FST term dictionary with per-term offsets into postings.
 //! FST provides O(|key|) lookups and efficient prefix/range queries.
 
 use std::io::{self, Write};

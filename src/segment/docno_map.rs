@@ -1,6 +1,6 @@
 //! Dense document number mapping
 //!
-//! Per SPEC Decision 2.5 — Internal DocId mapping is mandatory for performance:
+//! Internal DocId mapping is mandatory for performance:
 //! - Each segment allocates a dense `docno: u32` in `[0..max_doc)` space.
 //! - Store per-segment arrays: `docno -> (doc_id, version)` (packed, mmappable).
 //! - `delete_bitset` per segment.

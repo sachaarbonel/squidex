@@ -1,6 +1,6 @@
 //! Immutable segment reader backed by mmapped files
 //!
-//! Per SPEC: reads operate over `(mutable_buffer + segments[])` and merge top-k.
+//! reads operate over `(mutable_buffer + segments[])` and merge top-k.
 //! Each segment reader provides access to postings, term dictionary, docvalues,
 //! and segment statistics.
 

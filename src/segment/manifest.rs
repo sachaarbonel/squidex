@@ -1,6 +1,6 @@
 //! Segment manifest for tracking live segments
 //!
-//! Per SPEC Decision 5.2.4 — Manifest Atomicity:
+//! Manifest Atomicity:
 //! 1. Write new segment files → fsync
 //! 2. Write segments.manifest.tmp → fsync
 //! 3. Atomic rename to segments.manifest → fsync directory

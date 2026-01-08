@@ -9,7 +9,7 @@ use crate::models::*;
 use crate::state_machine::scoring::*;
 use crate::state_machine::snapshot::{SearchSnapshot, SNAPSHOT_VERSION};
 use crate::tokenizer::Tokenizer;
-use crate::vector::QuantizedVectorStore;
+use crate::vector::HnswIndex;
 
 /// Production-ready distributed search state machine
 pub struct SearchStateMachine {
@@ -19,8 +19,8 @@ pub struct SearchStateMachine {
     // Inverted index for keyword search
     inverted_index: RwLock<HashMap<String, PostingList>>,
 
-    // Vector storage for similarity search (Product Quantization)
-    vector_store: RwLock<QuantizedVectorStore>,
+    // Vector storage for similarity search (HNSW + Product Quantization)
+    hnsw_index: RwLock<HnswIndex>,
 
     // Metadata indices for filtering
     tag_index: RwLock<HashMap<String, HashSet<DocumentId>>>,
@@ -46,22 +46,17 @@ impl SearchStateMachine {
     pub fn new(settings: IndexSettings) -> Self {
         let tokenizer = Tokenizer::new(&settings.tokenizer_config);
 
-        // Create the vector store with PQ configuration
-        let vector_store = if settings.pq_config.enabled {
-            QuantizedVectorStore::with_cache_size(
-                settings.vector_dimensions,
-                settings.pq_config.num_subspaces,
-                settings.pq_config.full_precision_cache_size,
-            )
-        } else {
-            // Use minimal subspaces when PQ is disabled (still uses the store but with buffering)
-            QuantizedVectorStore::new(settings.vector_dimensions, settings.pq_config.num_subspaces)
-        };
+        // Create the HNSW index with PQ configuration
+        let hnsw_index = HnswIndex::new(
+            settings.vector_dimensions,
+            settings.pq_config.num_subspaces,
+            Default::default(),
+        );
 
         Self {
             documents: RwLock::new(HashMap::new()),
             inverted_index: RwLock::new(HashMap::new()),
-            vector_store: RwLock::new(vector_store),
+            hnsw_index: RwLock::new(hnsw_index),
             tag_index: RwLock::new(HashMap::new()),
             source_index: RwLock::new(HashMap::new()),
             date_index: RwLock::new(BTreeMap::new()),
@@ -104,13 +99,13 @@ impl SearchStateMachine {
             }
         }
 
-        // Update vector store (with auto-training check)
+        // Update HNSW index (with auto-training check)
         {
-            let mut store = self.vector_store.write();
-            store.store(doc_id, &doc.embedding)?;
+            let mut index = self.hnsw_index.write();
+            index.insert(doc_id, &doc.embedding)?;
 
             // Check if we should trigger auto-training
-            if pq_enabled && store.should_auto_train(min_training_vectors) {
+            if pq_enabled && index.should_auto_train(min_training_vectors) {
                 self.pq_training_pending.store(true, Ordering::SeqCst);
             }
         }
@@ -133,8 +128,8 @@ impl SearchStateMachine {
 
     /// Attempt to auto-train the PQ codebooks if conditions are met
     fn try_auto_train(&self) {
-        let mut store = self.vector_store.write();
-        if let Err(e) = store.auto_train() {
+        let mut index = self.hnsw_index.write();
+        if let Err(e) = index.auto_train() {
             // Log the error but don't fail the operation
             tracing::warn!("PQ auto-training failed: {}", e);
         }
@@ -163,8 +158,8 @@ impl SearchStateMachine {
             }
         }
 
-        // Remove from vector store
-        self.vector_store.write().remove(doc_id);
+        // Remove from HNSW index (soft delete)
+        self.hnsw_index.write().remove(doc_id);
 
         // Remove from metadata indices
         self.remove_from_metadata_indices(&doc);
@@ -243,41 +238,72 @@ impl SearchStateMachine {
         self.collect_top_k_results(scores, top_k)
     }
 
-    /// Vector similarity search using Product Quantization when available
+    /// Vector similarity search using HNSW with two-phase routing
+    ///
+    /// - If candidate_count <= brute_force_threshold: use PQ ADC brute force
+    /// - Else: use HNSW with adaptive ef_search
     pub fn vector_search(&self, query_embedding: &[f32], top_k: usize) -> Vec<SearchResult> {
-        let store = self.vector_store.read();
+        let index = self.hnsw_index.read();
         let settings = self.settings.read();
 
         if query_embedding.len() != settings.vector_dimensions {
             return Vec::new();
         }
 
-        // If store is trained, use ADC-based search
-        if store.is_trained() {
-            match store.search(query_embedding, top_k) {
+        // brute_force_threshold for filtered ANN
+        const BRUTE_FORCE_THRESHOLD: usize = 1000;
+
+        let total_vectors = index.len();
+        drop(settings);
+
+        // If HNSW is trained and we have enough vectors, use HNSW
+        if index.is_trained() && total_vectors > BRUTE_FORCE_THRESHOLD {
+            // Use adaptive ef_search based on collection size
+            let ef = index.compute_adaptive_ef(total_vectors);
+
+            match index.search_with_ef(query_embedding, top_k, ef) {
                 Ok(results) => {
                     // Convert distance to similarity score (inverse relationship)
-                    // Lower distance = higher similarity
                     let max_dist = results.iter().map(|(_, d)| *d).fold(0.0f32, f32::max);
                     let max_dist = if max_dist == 0.0 { 1.0 } else { max_dist };
 
                     return results
                         .into_iter()
                         .map(|(doc_id, distance)| {
-                            // Convert distance to similarity score (1.0 = identical, 0.0 = max distance)
                             let score = 1.0 - (distance / (max_dist + 1.0));
                             SearchResult::new(doc_id, score)
                         })
                         .collect();
                 }
                 Err(e) => {
-                    tracing::warn!("PQ search failed, falling back to brute force: {}", e);
+                    tracing::warn!("HNSW search failed, falling back to brute force: {}", e);
                 }
             }
         }
 
-        // Fallback: brute force search on documents (when PQ not trained)
-        // This uses the original embeddings stored in documents
+        // Brute force path: use PQ ADC when trained, else raw embeddings
+        if index.is_trained() {
+            match index.brute_force_search(query_embedding, top_k) {
+                Ok(results) => {
+                    let max_dist = results.iter().map(|(_, d)| *d).fold(0.0f32, f32::max);
+                    let max_dist = if max_dist == 0.0 { 1.0 } else { max_dist };
+
+                    return results
+                        .into_iter()
+                        .map(|(doc_id, distance)| {
+                            let score = 1.0 - (distance / (max_dist + 1.0));
+                            SearchResult::new(doc_id, score)
+                        })
+                        .collect();
+                }
+                Err(e) => {
+                    tracing::warn!("PQ brute force failed, falling back to raw: {}", e);
+                }
+            }
+        }
+
+        // Final fallback: brute force on raw embeddings
+        let settings = self.settings.read();
         let docs = self.documents.read();
         let similarity_metric = settings.similarity_metric.clone();
         drop(settings);
@@ -296,7 +322,6 @@ impl SearchStateMachine {
             })
             .collect();
 
-        // Sort by score descending
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(top_k);
 
@@ -393,7 +418,7 @@ impl SearchStateMachine {
         // Shrink hash maps
         self.documents.write().shrink_to_fit();
         self.inverted_index.write().shrink_to_fit();
-        // Note: QuantizedVectorStore uses compact storage by design (PQ)
+        // Note: HnswIndex uses compact storage by design (PQ + HNSW)
 
         Ok(())
     }
@@ -514,12 +539,12 @@ impl SearchStateMachine {
 
     /// Create a complete snapshot of the search index
     pub fn create_snapshot(&self) -> Vec<u8> {
-        let vector_store_snapshot = self.vector_store.read().create_snapshot();
+        let hnsw_snapshot = self.hnsw_index.read().create_snapshot();
 
         let snapshot = SearchSnapshot::new(
             self.documents.read().clone(),
             self.inverted_index.read().clone(),
-            vector_store_snapshot,
+            hnsw_snapshot,
             self.tag_index.read().clone(),
             self.source_index.read().clone(),
             self.date_index.read().clone(),
@@ -553,14 +578,14 @@ impl SearchStateMachine {
         // Get cache size from settings
         let cache_size = snapshot.settings.pq_config.full_precision_cache_size;
 
-        // Restore vector store from snapshot
-        let restored_vector_store =
-            QuantizedVectorStore::restore_from_snapshot(snapshot.vector_store, cache_size);
+        // Restore HNSW index from snapshot
+        let restored_hnsw_index =
+            HnswIndex::restore_from_snapshot(snapshot.hnsw_index, cache_size);
 
         // Atomically restore all state
         *self.documents.write() = snapshot.documents;
         *self.inverted_index.write() = snapshot.inverted_index;
-        *self.vector_store.write() = restored_vector_store;
+        *self.hnsw_index.write() = restored_hnsw_index;
         *self.tag_index.write() = snapshot.tag_index;
         *self.source_index.write() = snapshot.source_index;
         *self.date_index.write() = snapshot.date_index;

@@ -57,7 +57,7 @@ impl TermId {
     }
 }
 
-/// External document ID (UUIDv7 stored as u128 per SPEC)
+/// External document ID (UUIDv7 stored as u128)
 /// For simplicity, we use u64 to match the existing DocumentId type
 pub type DocumentId = u64;
 
@@ -101,7 +101,7 @@ impl Posting {
 }
 
 /// Block of postings (fixed size for SIMD-friendly processing)
-/// Per SPEC: 128 or 256 docs per block
+/// 128 or 256 docs per block
 pub const BLOCK_SIZE: usize = 128;
 
 /// A block of postings with skip data and impact metadata

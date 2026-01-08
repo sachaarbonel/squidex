@@ -1,6 +1,6 @@
 //! DocValues for columnar storage
 //!
-//! Per SPEC: typed column stores with:
+//! typed column stores with:
 //! - numeric: bitpacked blocks + optional delta coding + per-block min/max
 //! - boolean: roaring bitmap or dense bitset
 //! - keyword/string: dictionary encode to ordinals + bitpacked ordinals

@@ -1,6 +1,6 @@
 //! Segment statistics for BM25+ scoring
 //!
-//! Per SPEC: per segment store `doc_len` (bitpacked), `avgdl`, and `doc_count`.
+//! per segment store `doc_len` (bitpacked), `avgdl`, and `doc_count`.
 //! Mutable buffers maintain their own stats; segment merges recompute stats on write.
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use super::types::{DocNo, DocumentId};
 
-/// BM25+ parameters (per SPEC defaults)
+/// BM25+ parameters
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Bm25Params {
     /// Term frequency saturation parameter

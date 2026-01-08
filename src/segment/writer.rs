@@ -1,6 +1,6 @@
 //! Segment writer for creating new immutable segments
 //!
-//! Per SPEC: when buffer hits thresholds, write a new immutable segment:
+//! when buffer hits thresholds, write a new immutable segment:
 //! - postings + term dictionary + docvalues column files
 //! - vector store (handled separately)
 

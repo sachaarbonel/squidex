@@ -1,6 +1,6 @@
 //! Segment index combining mutable buffer + immutable segments
 //!
-//! Per SPEC: SegmentIndex = mutable buffer + immutable segments
+//! SegmentIndex = mutable buffer + immutable segments
 //! Provides BM25+ scoring across buffer + segments
 
 use std::collections::{BinaryHeap, HashMap};

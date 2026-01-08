@@ -1,6 +1,6 @@
 //! Tiered merge policy for segment management
 //!
-//! Per SPEC Decision 3.1 — Segment size & merge policy:
+//! Segment size & merge policy:
 //! - max_merged_segment = 5GB (NVMe-friendly)
 //! - segments_per_tier = 10
 //! - Merge score accounts for size, deletes %, and search cost (segment count)

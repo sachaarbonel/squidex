@@ -1,6 +1,6 @@
 //! Postings format with block-based compression
 //!
-//! Per SPEC: store postings in fixed-size blocks (128/256 docs) with:
+//! store postings in fixed-size blocks (128/256 docs) with:
 //! - docID deltas: bitpacked
 //! - TF: bitpacked
 //! - positions: separate stream

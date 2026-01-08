@@ -72,6 +72,7 @@ fst = "0.4"
 memmap2 = "0.9"
 arc-swap = "1.6"
 roaring = "0.10"
+ordered-float = "5.1.0"
 
 [build-dependencies]
 tonic-build = "0.11"
