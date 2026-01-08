@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::config::IndexSettings;
 use crate::error::{Result, SquidexError};
@@ -287,7 +287,9 @@ impl SearchStateMachine {
             .map(|(doc_id, doc)| {
                 let score = match similarity_metric {
                     SimilarityMetric::Cosine => cosine_similarity(query_embedding, &doc.embedding),
-                    SimilarityMetric::Euclidean => euclidean_similarity(query_embedding, &doc.embedding),
+                    SimilarityMetric::Euclidean => {
+                        euclidean_similarity(query_embedding, &doc.embedding)
+                    }
                     SimilarityMetric::DotProduct => dot_product(query_embedding, &doc.embedding),
                 };
                 (*doc_id, score)
@@ -358,12 +360,7 @@ impl SearchStateMachine {
     /// Get documents matching a specific filter
     fn get_filtered_documents(&self, filter: &Filter) -> HashSet<DocumentId> {
         match filter {
-            Filter::Tag(tag) => self
-                .tag_index
-                .read()
-                .get(tag)
-                .cloned()
-                .unwrap_or_default(),
+            Filter::Tag(tag) => self.tag_index.read().get(tag).cloned().unwrap_or_default(),
             Filter::Source(source) => self
                 .source_index
                 .read()
@@ -541,8 +538,9 @@ impl SearchStateMachine {
             return Ok(());
         }
 
-        let snapshot = SearchSnapshot::from_bytes(data)
-            .map_err(|e| SquidexError::Internal(format!("Failed to deserialize snapshot: {}", e)))?;
+        let snapshot = SearchSnapshot::from_bytes(data).map_err(|e| {
+            SquidexError::Internal(format!("Failed to deserialize snapshot: {}", e))
+        })?;
 
         // Validate version compatibility
         if !snapshot.is_compatible() {
@@ -556,10 +554,8 @@ impl SearchStateMachine {
         let cache_size = snapshot.settings.pq_config.full_precision_cache_size;
 
         // Restore vector store from snapshot
-        let restored_vector_store = QuantizedVectorStore::restore_from_snapshot(
-            snapshot.vector_store,
-            cache_size,
-        );
+        let restored_vector_store =
+            QuantizedVectorStore::restore_from_snapshot(snapshot.vector_store, cache_size);
 
         // Atomically restore all state
         *self.documents.write() = snapshot.documents;
@@ -613,8 +609,8 @@ impl SearchStateMachine {
                         }
                     }
                 }
-                let response = bincode::serialize(&indexed)
-                    .map_err(|e| SquidexError::Serialization(e))?;
+                let response =
+                    bincode::serialize(&indexed).map_err(|e| SquidexError::Serialization(e))?;
                 Ok(Bytes::from(response))
             }
 

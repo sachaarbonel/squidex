@@ -10,8 +10,9 @@ use crate::models::{Document, DocumentId};
 pub type NodeId = u64;
 
 /// OpenRaft type configuration for Squidex
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
-#[derive(Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
+)]
 pub struct TypeConfig;
 
 impl fmt::Display for TypeConfig {

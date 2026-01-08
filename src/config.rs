@@ -39,8 +39,8 @@ pub struct ProductQuantizationConfig {
 impl Default for ProductQuantizationConfig {
     fn default() -> Self {
         Self {
-            num_subspaces: 24,           // 384 / 24 = 16 dims per subspace
-            min_training_vectors: 1000,  // Train after 1000 vectors
+            num_subspaces: 24,          // 384 / 24 = 16 dims per subspace
+            min_training_vectors: 1000, // Train after 1000 vectors
             enabled: true,
             full_precision_cache_size: 10_000,
         }

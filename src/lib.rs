@@ -9,8 +9,10 @@ pub mod tokenizer;
 pub mod vector;
 
 pub use api::{create_router, AppState};
-pub use config::{IndexSettings, NodeConfig, PerformanceProfile, ProductQuantizationConfig, TokenizerConfig};
-pub use consensus::{LogEntry, SquidexNode, RaftServiceImpl};
+pub use config::{
+    IndexSettings, NodeConfig, PerformanceProfile, ProductQuantizationConfig, TokenizerConfig,
+};
+pub use consensus::{LogEntry, RaftServiceImpl, SquidexNode};
 pub use error::{Result, SquidexError};
 pub use metrics::SearchMetrics;
 pub use models::*;

@@ -128,7 +128,10 @@ mod tests {
 
         // At least some content words should remain
         let has_content = !tokens.is_empty();
-        assert!(has_content, "Should have some tokens after stopword removal");
+        assert!(
+            has_content,
+            "Should have some tokens after stopword removal"
+        );
     }
 
     #[test]

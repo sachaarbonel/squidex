@@ -55,10 +55,7 @@ impl SquidexNetwork {
     }
 
     /// Get or create a gRPC client for a target node
-    async fn get_client(
-        &self,
-        target: NodeId,
-    ) -> Result<RaftServiceClient<Channel>, Unreachable> {
+    async fn get_client(&self, target: NodeId) -> Result<RaftServiceClient<Channel>, Unreachable> {
         // Check cache first
         if let Some(client) = self.clients.get(&target) {
             return Ok(client.clone());
@@ -68,29 +65,32 @@ impl SquidexNetwork {
         let addr = self
             .peers
             .get(&target)
-            .ok_or_else(|| Unreachable::new(&std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("peer {} not found", target),
-            )))?
+            .ok_or_else(|| {
+                Unreachable::new(&std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("peer {} not found", target),
+                ))
+            })?
             .clone();
 
         // Create new client
         let endpoint = Channel::from_shared(format!("http://{}", addr))
-            .map_err(|e| Unreachable::new(&std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                e.to_string(),
-            )))?
+            .map_err(|e| {
+                Unreachable::new(&std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    e.to_string(),
+                ))
+            })?
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .tcp_keepalive(Some(Duration::from_secs(30)));
 
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| Unreachable::new(&std::io::Error::new(
+        let channel = endpoint.connect().await.map_err(|e| {
+            Unreachable::new(&std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 e.to_string(),
-            )))?;
+            ))
+        })?;
 
         let client = RaftServiceClient::new(channel);
 
@@ -135,10 +135,7 @@ impl RaftNetwork<TypeConfig> for SquidexConnection {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: openraft::network::RPCOption,
-    ) -> Result<
-        AppendEntriesResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId>>,
-    > {
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let mut client = self
             .network
             .get_client(self.target)
@@ -148,15 +145,12 @@ impl RaftNetwork<TypeConfig> for SquidexConnection {
         // Convert to proto
         let request = tonic::Request::new(to_proto_append_entries(&rpc));
 
-        let response = client
-            .append_entries(request)
-            .await
-            .map_err(|e| {
-                RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))
-            })?;
+        let response = client.append_entries(request).await.map_err(|e| {
+            RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )))
+        })?;
 
         // Convert from proto
         from_proto_append_entries_response(response.into_inner()).map_err(|e| {
@@ -184,15 +178,12 @@ impl RaftNetwork<TypeConfig> for SquidexConnection {
         // Convert to proto
         let request = tonic::Request::new(to_proto_install_snapshot(&rpc));
 
-        let response = client
-            .install_snapshot(request)
-            .await
-            .map_err(|e| {
-                RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))
-            })?;
+        let response = client.install_snapshot(request).await.map_err(|e| {
+            RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )))
+        })?;
 
         // Convert from proto
         from_proto_install_snapshot_response(response.into_inner()).map_err(|e| {
@@ -217,15 +208,12 @@ impl RaftNetwork<TypeConfig> for SquidexConnection {
         // Convert to proto
         let request = tonic::Request::new(to_proto_vote_request(&rpc));
 
-        let response = client
-            .vote(request)
-            .await
-            .map_err(|e| {
-                RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                )))
-            })?;
+        let response = client.vote(request).await.map_err(|e| {
+            RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            )))
+        })?;
 
         // Convert from proto
         from_proto_vote_response(response.into_inner()).map_err(|e| {
@@ -248,7 +236,8 @@ fn to_proto_log_id(log_id: Option<openraft::LogId<NodeId>>) -> Option<proto::Log
 }
 
 fn from_proto_log_id(log_id: Option<proto::LogId>) -> Option<openraft::LogId<NodeId>> {
-    log_id.map(|l| openraft::LogId::new(openraft::CommittedLeaderId::new(l.term, l.node_id), l.index))
+    log_id
+        .map(|l| openraft::LogId::new(openraft::CommittedLeaderId::new(l.term, l.node_id), l.index))
 }
 
 fn to_proto_vote(vote: openraft::Vote<NodeId>) -> proto::VoteData {
@@ -311,9 +300,7 @@ fn to_proto_vote_request(rpc: &VoteRequest<NodeId>) -> proto::VoteRequest {
     }
 }
 
-fn from_proto_vote_response(
-    resp: proto::VoteResponse,
-) -> Result<VoteResponse<NodeId>, String> {
+fn from_proto_vote_response(resp: proto::VoteResponse) -> Result<VoteResponse<NodeId>, String> {
     Ok(VoteResponse {
         vote: from_proto_vote(resp.vote),
         vote_granted: resp.vote_granted,

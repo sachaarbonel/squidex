@@ -385,7 +385,8 @@ mod tests {
     #[test]
     fn test_encode_decode() {
         // Train a simple codebook
-        let training_data: Vec<Vec<f32>> = (0..1000).map(|i| vec![i as f32, (i * 2) as f32]).collect();
+        let training_data: Vec<Vec<f32>> =
+            (0..1000).map(|i| vec![i as f32, (i * 2) as f32]).collect();
 
         let mut codebook = Codebook::new();
         codebook.train(&training_data, NUM_CENTROIDS).unwrap();

@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use squidex::consensus::proto::raft_service_server::RaftServiceServer;
-use squidex::{IndexSettings, NodeConfig, PerformanceProfile, RaftServiceImpl, SearchStateMachine, SquidexNode};
+use squidex::{
+    IndexSettings, NodeConfig, PerformanceProfile, RaftServiceImpl, SearchStateMachine, SquidexNode,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::transport::Server;
@@ -69,10 +71,7 @@ async fn main() -> Result<()> {
         "high-throughput" | "high_throughput" => PerformanceProfile::HighThroughput,
         "durable" => PerformanceProfile::Durable,
         _ => {
-            warn!(
-                "Unknown profile '{}', using 'balanced'",
-                args.profile
-            );
+            warn!("Unknown profile '{}', using 'balanced'", args.profile);
             PerformanceProfile::Balanced
         }
     };
@@ -100,16 +99,18 @@ async fn main() -> Result<()> {
 
     info!("Index settings:");
     info!("  Vector dimensions: {}", index_settings.vector_dimensions);
-    info!("  Similarity metric: {:?}", index_settings.similarity_metric);
+    info!(
+        "  Similarity metric: {:?}",
+        index_settings.similarity_metric
+    );
 
     // Create state machine
     let state_machine = Arc::new(SearchStateMachine::new(index_settings));
     info!("Search state machine initialized");
 
     // Create Squidex node (OpenRaft-based)
-    let node = Arc::new(
-        SquidexNode::new(args.node_id, node_config.clone(), state_machine.clone()).await?,
-    );
+    let node =
+        Arc::new(SquidexNode::new(args.node_id, node_config.clone(), state_machine.clone()).await?);
     info!("Raft node created");
 
     // Start Raft node

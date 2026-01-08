@@ -1,4 +1,6 @@
-use squidex::{Document, DocumentMetadata, IndexSettings, NodeConfig, SearchStateMachine, SquidexNode};
+use squidex::{
+    Document, DocumentMetadata, IndexSettings, NodeConfig, SearchStateMachine, SquidexNode,
+};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -133,8 +135,7 @@ async fn test_vector_and_hybrid_search() -> Result<(), Box<dyn std::error::Error
     assert_eq!(vector_results[0].doc_id, 1);
 
     // Test hybrid search
-    let hybrid_results =
-        state_machine.hybrid_search("rust", &query_embedding, 10, 0.5);
+    let hybrid_results = state_machine.hybrid_search("rust", &query_embedding, 10, 0.5);
     assert!(!hybrid_results.is_empty());
 
     Ok(())

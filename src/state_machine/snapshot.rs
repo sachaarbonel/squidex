@@ -72,12 +72,14 @@ impl SearchSnapshot {
     /// Get the size of this snapshot in bytes (approximate)
     pub fn estimated_size(&self) -> usize {
         // Rough estimation for monitoring
-        let quantized_size = self.vector_store.quantized_vectors.len()
-            * self.vector_store.num_subspaces; // 1 byte per subspace
-        let codebook_size = self.vector_store.num_subspaces * 256
-            * (self.vector_store.dimensions / self.vector_store.num_subspaces) * 4;
-        let buffer_size = self.vector_store.training_buffer.len()
-            * self.vector_store.dimensions * 4;
+        let quantized_size =
+            self.vector_store.quantized_vectors.len() * self.vector_store.num_subspaces; // 1 byte per subspace
+        let codebook_size = self.vector_store.num_subspaces
+            * 256
+            * (self.vector_store.dimensions / self.vector_store.num_subspaces)
+            * 4;
+        let buffer_size =
+            self.vector_store.training_buffer.len() * self.vector_store.dimensions * 4;
 
         std::mem::size_of::<Self>()
             + self.documents.len() * 1000 // Approximate per-document size

@@ -42,16 +42,18 @@ impl SquidexNode {
         // Configure Raft
         let raft_config = Config {
             cluster_name: "squidex".to_string(),
-            heartbeat_interval: 500,  // 500ms
+            heartbeat_interval: 500, // 500ms
             election_timeout_min: 1500,
             election_timeout_max: 3000,
             max_in_snapshot_log_to_keep: 1000,
             ..Default::default()
         };
 
-        let raft_config = Arc::new(raft_config.validate().map_err(|e| {
-            SquidexError::Internal(format!("invalid raft config: {}", e))
-        })?);
+        let raft_config = Arc::new(
+            raft_config
+                .validate()
+                .map_err(|e| SquidexError::Internal(format!("invalid raft config: {}", e)))?,
+        );
 
         // Create data directory
         let data_dir = config.data_dir.join(format!("node{}", node_id));
@@ -167,11 +169,7 @@ impl SquidexNode {
     pub async fn membership(&self) -> ClusterMembership {
         let metrics = self.raft.metrics().borrow().clone();
 
-        let voters: Vec<NodeId> = metrics
-            .membership_config
-            .membership()
-            .voter_ids()
-            .collect();
+        let voters: Vec<NodeId> = metrics.membership_config.membership().voter_ids().collect();
 
         let learners: Vec<NodeId> = metrics
             .membership_config
@@ -205,7 +203,9 @@ impl SquidexNode {
         self.raft
             .change_membership(new_voters, false)
             .await
-            .map_err(|e| SquidexError::Consensus(format!("failed to change membership: {:?}", e)))?;
+            .map_err(|e| {
+                SquidexError::Consensus(format!("failed to change membership: {:?}", e))
+            })?;
 
         info!("Added node {} to cluster", node_id);
         Ok(())
@@ -227,7 +227,9 @@ impl SquidexNode {
         self.raft
             .change_membership(new_voters, false)
             .await
-            .map_err(|e| SquidexError::Consensus(format!("failed to change membership: {:?}", e)))?;
+            .map_err(|e| {
+                SquidexError::Consensus(format!("failed to change membership: {:?}", e))
+            })?;
 
         // Remove from network
         self.network.remove_peer(node_id);

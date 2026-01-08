@@ -357,9 +357,7 @@ impl QuantizedVectorStore {
 
         // If not trained, buffer the vector for later
         if !self.trained {
-            self.training_buffer
-                .write()
-                .push((doc_id, vector.to_vec()));
+            self.training_buffer.write().push((doc_id, vector.to_vec()));
             // Return empty codes as placeholder
             return Ok(QuantizedVector {
                 codes: vec![0; self.num_subspaces],
@@ -487,11 +485,7 @@ impl QuantizedVectorStore {
     }
 
     /// Compute asymmetric distance using codes directly (no lookup needed)
-    pub fn distance_quantized_codes(
-        &self,
-        tables: &[[f32; NUM_CENTROIDS]],
-        codes: &[u8],
-    ) -> f32 {
+    pub fn distance_quantized_codes(&self, tables: &[[f32; NUM_CENTROIDS]], codes: &[u8]) -> f32 {
         let mut distance_sq = 0.0;
 
         for (subspace_id, &code) in codes.iter().enumerate() {
@@ -846,7 +840,11 @@ mod tests {
         }
         // Average difference per dimension should be reasonable
         let avg_diff = diff / 16.0;
-        assert!(avg_diff < 0.5, "Reconstruction error too high: {}", avg_diff);
+        assert!(
+            avg_diff < 0.5,
+            "Reconstruction error too high: {}",
+            avg_diff
+        );
     }
 
     #[test]

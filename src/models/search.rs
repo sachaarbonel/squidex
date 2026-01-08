@@ -14,11 +14,11 @@ pub struct SearchResult {
 /// Search request
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchRequest {
-    pub query: Option<String>,          // Keyword query
-    pub embedding: Option<Embedding>,    // Vector query
-    pub filters: Vec<Filter>,            // Metadata filters
-    pub top_k: usize,                    // Number of results
-    pub search_mode: SearchMode,         // Keyword, Vector, or Hybrid
+    pub query: Option<String>,        // Keyword query
+    pub embedding: Option<Embedding>, // Vector query
+    pub filters: Vec<Filter>,         // Metadata filters
+    pub top_k: usize,                 // Number of results
+    pub search_mode: SearchMode,      // Keyword, Vector, or Hybrid
 }
 
 impl Default for SearchRequest {
@@ -86,8 +86,7 @@ mod tests {
 
     #[test]
     fn test_search_result_builder() {
-        let result = SearchResult::new(42, 0.95)
-            .with_highlights(vec!["highlight".to_string()]);
+        let result = SearchResult::new(42, 0.95).with_highlights(vec!["highlight".to_string()]);
         assert_eq!(result.doc_id, 42);
         assert_eq!(result.score, 0.95);
         assert_eq!(result.highlights.len(), 1);

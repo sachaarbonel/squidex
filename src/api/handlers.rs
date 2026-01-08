@@ -133,24 +133,24 @@ pub async fn search(
 
     let results = match req.mode {
         SearchModeApi::Keyword => {
-            let query = req
-                .query
-                .ok_or_else(|| ApiError::BadRequest("query required for keyword search".to_string()))?;
+            let query = req.query.ok_or_else(|| {
+                ApiError::BadRequest("query required for keyword search".to_string())
+            })?;
             state.state_machine.keyword_search(&query, req.top_k)
         }
         SearchModeApi::Vector => {
-            let embedding = req
-                .embedding
-                .ok_or_else(|| ApiError::BadRequest("embedding required for vector search".to_string()))?;
+            let embedding = req.embedding.ok_or_else(|| {
+                ApiError::BadRequest("embedding required for vector search".to_string())
+            })?;
             state.state_machine.vector_search(&embedding, req.top_k)
         }
         SearchModeApi::Hybrid => {
-            let query = req
-                .query
-                .ok_or_else(|| ApiError::BadRequest("query required for hybrid search".to_string()))?;
-            let embedding = req
-                .embedding
-                .ok_or_else(|| ApiError::BadRequest("embedding required for hybrid search".to_string()))?;
+            let query = req.query.ok_or_else(|| {
+                ApiError::BadRequest("query required for hybrid search".to_string())
+            })?;
+            let embedding = req.embedding.ok_or_else(|| {
+                ApiError::BadRequest("embedding required for hybrid search".to_string())
+            })?;
             state
                 .state_machine
                 .hybrid_search(&query, &embedding, req.top_k, req.keyword_weight)
@@ -241,7 +241,10 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     (
         axum::http::StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         buffer,
     )
 }
