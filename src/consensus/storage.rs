@@ -1,36 +1,21 @@
-use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
-    Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder,
-    SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
+    Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder, SnapshotMeta,
+    StorageError, StorageIOError, StoredMembership, Vote,
 };
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use super::types::{LogEntry, NodeId, Response, SquidexSnapshot, TypeConfig};
+use crate::error::SquidexError;
 use crate::state_machine::SearchStateMachine;
-
-/// Log store state
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LogStoreState {
-    /// The last purged log id
-    pub last_purged_log_id: Option<LogId<NodeId>>,
-
-    /// All log entries
-    pub logs: BTreeMap<u64, Entry<TypeConfig>>,
-
-    /// The current vote
-    pub vote: Option<Vote<NodeId>>,
-
-    /// Committed vote (for storage)
-    pub committed: bool,
-}
 
 /// State machine state for persistence
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -39,43 +24,175 @@ pub struct StateMachineState {
     pub last_membership: StoredMembership<NodeId, openraft::BasicNode>,
 }
 
-/// RocksDB-backed Raft log storage
-pub struct SquidexLogStore {
-    /// Data directory
-    data_dir: PathBuf,
+const LOG_KEYSPACE: &str = "raft_logs";
+const META_KEYSPACE: &str = "raft_meta";
+const META_LAST_PURGED: &[u8] = b"last_purged_log_id";
+const META_VOTE: &[u8] = b"vote";
+const META_COMMITTED: &[u8] = b"committed_log_id";
 
-    /// In-memory state (can be persisted to RocksDB)
-    state: RwLock<LogStoreState>,
+struct SquidexLogStoreInner {
+    db: Database,
+    logs: Keyspace,
+    meta: Keyspace,
+}
+
+/// Fjall-backed Raft log storage.
+#[derive(Clone)]
+pub struct SquidexLogStore {
+    inner: Arc<SquidexLogStoreInner>,
 }
 
 impl SquidexLogStore {
-    pub fn new(data_dir: PathBuf) -> Self {
-        // Create data directory if it doesn't exist
-        std::fs::create_dir_all(&data_dir).ok();
+    pub fn new(data_dir: PathBuf) -> Result<Self, SquidexError> {
+        let log_dir = data_dir.join("raft-log");
+        std::fs::create_dir_all(&log_dir)?;
 
-        // Try to load existing state
-        let state_path = data_dir.join("log_state.bin");
-        let state = if state_path.exists() {
-            match std::fs::read(&state_path) {
-                Ok(data) => bincode::deserialize(&data).unwrap_or_default(),
-                Err(_) => LogStoreState::default(),
-            }
-        } else {
-            LogStoreState::default()
-        };
+        let db = Database::builder(&log_dir)
+            .open()
+            .map_err(|e| SquidexError::Internal(format!("failed to open fjall db: {}", e)))?;
 
-        Self {
-            data_dir,
-            state: RwLock::new(state),
-        }
+        let logs = db
+            .keyspace(LOG_KEYSPACE, || KeyspaceCreateOptions::default())
+            .map_err(|e| {
+                SquidexError::Internal(format!("failed to open fjall logs keyspace: {}", e))
+            })?;
+
+        let meta = db
+            .keyspace(META_KEYSPACE, || KeyspaceCreateOptions::default())
+            .map_err(|e| {
+                SquidexError::Internal(format!("failed to open fjall meta keyspace: {}", e))
+            })?;
+
+        Ok(Self {
+            inner: Arc::new(SquidexLogStoreInner { db, logs, meta }),
+        })
     }
 
-    fn persist_state(&self) {
-        let state = self.state.read();
-        let state_path = self.data_dir.join("log_state.bin");
-        if let Ok(data) = bincode::serialize(&*state) {
-            let _ = std::fs::write(state_path, data);
+    fn encode_log_key(index: u64) -> [u8; 8] {
+        index.to_be_bytes()
+    }
+
+    fn decode_log_key(key: &[u8]) -> Option<u64> {
+        if key.len() != 8 {
+            return None;
         }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(key);
+        Some(u64::from_be_bytes(buf))
+    }
+
+    fn deserialize_entry(
+        bytes: &[u8],
+        log_index: Option<u64>,
+    ) -> Result<Entry<TypeConfig>, StorageError<NodeId>> {
+        bincode::deserialize(bytes).map_err(|e| {
+            let err = match log_index {
+                Some(index) => StorageIOError::read_log_at_index(index, &e),
+                None => StorageIOError::read_logs(&e),
+            };
+            err.into()
+        })
+    }
+
+    fn last_log_id(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+        let mut iter = self.inner.logs.iter().rev();
+        let Some(item) = iter.next() else {
+            return Ok(None);
+        };
+
+        let kv = item;
+        let (key, value) = kv.into_inner().map_err(|e| StorageIOError::read_logs(&e))?;
+        let log_index = Self::decode_log_key(key.as_ref());
+        let entry = Self::deserialize_entry(value.as_ref(), log_index)?;
+        Ok(Some(entry.log_id))
+    }
+
+    fn read_log_entries(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
+        if let (Some(start), Some(end)) = (start, end) {
+            if start > end {
+                return Ok(Vec::new());
+            }
+        }
+
+        let iter = match (start, end) {
+            (Some(start), Some(end)) => {
+                let start_key = Self::encode_log_key(start).to_vec();
+                let end_key = Self::encode_log_key(end).to_vec();
+                self.inner.logs.range(start_key..=end_key)
+            }
+            (Some(start), None) => {
+                let start_key = Self::encode_log_key(start).to_vec();
+                self.inner.logs.range(start_key..)
+            }
+            (None, Some(end)) => {
+                let end_key = Self::encode_log_key(end).to_vec();
+                self.inner.logs.range(..=end_key)
+            }
+            (None, None) => self.inner.logs.iter(),
+        };
+
+        let mut entries = Vec::new();
+        for item in iter {
+            let kv = item;
+            let (key, value) = kv.into_inner().map_err(|e| StorageIOError::read_logs(&e))?;
+            let log_index = Self::decode_log_key(key.as_ref());
+            let entry = Self::deserialize_entry(value.as_ref(), log_index)?;
+            entries.push(entry);
+        }
+
+        Ok(entries)
+    }
+
+    fn remove_log_range(
+        &self,
+        start: Option<u64>,
+        end: Option<u64>,
+    ) -> Result<(), StorageError<NodeId>> {
+        if let (Some(start), Some(end)) = (start, end) {
+            if start > end {
+                return Ok(());
+            }
+        }
+
+        let iter = match (start, end) {
+            (Some(start), Some(end)) => {
+                let start_key = Self::encode_log_key(start).to_vec();
+                let end_key = Self::encode_log_key(end).to_vec();
+                self.inner.logs.range(start_key..=end_key)
+            }
+            (Some(start), None) => {
+                let start_key = Self::encode_log_key(start).to_vec();
+                self.inner.logs.range(start_key..)
+            }
+            (None, Some(end)) => {
+                let end_key = Self::encode_log_key(end).to_vec();
+                self.inner.logs.range(..=end_key)
+            }
+            (None, None) => self.inner.logs.iter(),
+        };
+
+        let mut keys = Vec::new();
+        for item in iter {
+            let kv = item;
+            let key = kv.key().map_err(|e| StorageIOError::read_logs(&e))?;
+            keys.push(key.as_ref().to_vec());
+        }
+
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = self.inner.db.batch().durability(Some(PersistMode::SyncAll));
+        for key in keys {
+            batch.remove(&self.inner.logs, key);
+        }
+
+        batch.commit().map_err(|e| StorageIOError::write_logs(&e))?;
+        Ok(())
     }
 }
 
@@ -84,15 +201,25 @@ impl RaftLogReader<TypeConfig> for SquidexLogStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
-        let state = self.state.read();
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(value) => Some(*value),
+            std::ops::Bound::Excluded(value) => match value.checked_add(1) {
+                Some(value) => Some(value),
+                None => return Ok(Vec::new()),
+            },
+            std::ops::Bound::Unbounded => None,
+        };
 
-        let entries: Vec<_> = state
-            .logs
-            .range(range)
-            .map(|(_, v)| v.clone())
-            .collect();
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(value) => Some(*value),
+            std::ops::Bound::Excluded(value) => match value.checked_sub(1) {
+                Some(value) => Some(value),
+                None => return Ok(Vec::new()),
+            },
+            std::ops::Bound::Unbounded => None,
+        };
 
-        Ok(entries)
+        self.read_log_entries(start, end)
     }
 }
 
@@ -100,10 +227,18 @@ impl RaftLogStorage<TypeConfig> for SquidexLogStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
-        let state = self.state.read();
-
-        let last_log_id = state.logs.last_key_value().map(|(_, v)| v.log_id);
-        let last_purged_log_id = state.last_purged_log_id;
+        let last_purged_log_id = match self
+            .inner
+            .meta
+            .get(META_LAST_PURGED)
+            .map_err(|e| StorageIOError::read_logs(&e))?
+        {
+            Some(bytes) => {
+                Some(bincode::deserialize(&bytes).map_err(|e| StorageIOError::read_logs(&e))?)
+            }
+            None => None,
+        };
+        let last_log_id = self.last_log_id()?;
 
         Ok(LogState {
             last_purged_log_id,
@@ -112,23 +247,30 @@ impl RaftLogStorage<TypeConfig> for SquidexLogStore {
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
-        // Return a clone of self's data
-        Self {
-            data_dir: self.data_dir.clone(),
-            state: RwLock::new(self.state.read().clone()),
-        }
+        self.clone()
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        let state = self.state.read();
-        Ok(state.vote)
+        let value = self
+            .inner
+            .meta
+            .get(META_VOTE)
+            .map_err(|e| StorageIOError::read_vote(&e))?;
+
+        match value {
+            Some(bytes) => Ok(Some(
+                bincode::deserialize(&bytes).map_err(|e| StorageIOError::read_vote(&e))?,
+            )),
+            None => Ok(None),
+        }
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let mut state = self.state.write();
-        state.vote = Some(*vote);
-        drop(state);
-        self.persist_state();
+        let bytes = bincode::serialize(vote).map_err(|e| StorageIOError::write_vote(&e))?;
+
+        let mut batch = self.inner.db.batch().durability(Some(PersistMode::SyncAll));
+        batch.insert(&self.inner.meta, META_VOTE, bytes);
+        batch.commit().map_err(|e| StorageIOError::write_vote(&e))?;
         Ok(())
     }
 
@@ -136,66 +278,75 @@ impl RaftLogStorage<TypeConfig> for SquidexLogStore {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        let mut state = self.state.write();
-        state.committed = committed.is_some();
-        drop(state);
-        self.persist_state();
+        let bytes = bincode::serialize(&committed).map_err(|e| StorageIOError::write_logs(&e))?;
+
+        let mut batch = self.inner.db.batch().durability(Some(PersistMode::SyncAll));
+        batch.insert(&self.inner.meta, META_COMMITTED, bytes);
+        batch.commit().map_err(|e| StorageIOError::write_logs(&e))?;
         Ok(())
     }
 
-    async fn append<I>(&mut self, entries: I, callback: LogFlushed<TypeConfig>) -> Result<(), StorageError<NodeId>>
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: LogFlushed<TypeConfig>,
+    ) -> Result<(), StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut state = self.state.write();
+        let result: Result<(), StorageError<NodeId>> =
+            (|| -> Result<(), StorageIOError<NodeId>> {
+                let mut batch = self.inner.db.batch().durability(Some(PersistMode::SyncAll));
 
-        for entry in entries {
-            state.logs.insert(entry.log_id.index, entry);
-        }
+                for entry in entries {
+                    let key = Self::encode_log_key(entry.log_id.index);
+                    let value = bincode::serialize(&entry)
+                        .map_err(|e| StorageIOError::write_log_entry(entry.log_id, &e))?;
+                    batch.insert(&self.inner.logs, key, value);
+                }
 
-        drop(state);
-        self.persist_state();
+                batch
+                    .commit()
+                    .map_err(|e| StorageIOError::<NodeId>::write_logs(&e))?;
+                Ok(())
+            })()
+            .map_err(Into::into);
 
-        callback.log_io_completed(Ok(()));
-        Ok(())
+        let io_result = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+        callback.log_io_completed(io_result);
+        result
     }
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let mut state = self.state.write();
-
-        let keys: Vec<_> = state
-            .logs
-            .range(log_id.index..)
-            .map(|(k, _)| *k)
-            .collect();
-
-        for key in keys {
-            state.logs.remove(&key);
-        }
-
-        drop(state);
-        self.persist_state();
-        Ok(())
+        self.remove_log_range(Some(log_id.index), None)
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let mut state = self.state.write();
-
-        let keys: Vec<_> = state
+        let mut keys = Vec::new();
+        let iter = self
+            .inner
             .logs
-            .range(..=log_id.index)
-            .map(|(k, _)| *k)
-            .collect();
+            .range(..=Self::encode_log_key(log_id.index).to_vec());
 
-        for key in keys {
-            state.logs.remove(&key);
+        for item in iter {
+            let kv = item;
+            let key = kv.key().map_err(|e| StorageIOError::read_logs(&e))?;
+            keys.push(key.as_ref().to_vec());
         }
 
-        state.last_purged_log_id = Some(log_id);
+        let mut batch = self.inner.db.batch().durability(Some(PersistMode::SyncAll));
+        for key in keys {
+            batch.remove(&self.inner.logs, key);
+        }
 
-        drop(state);
-        self.persist_state();
+        let meta_bytes = bincode::serialize(&log_id).map_err(|e| StorageIOError::write_logs(&e))?;
+        batch.insert(&self.inner.meta, META_LAST_PURGED, meta_bytes);
+
+        batch.commit().map_err(|e| StorageIOError::write_logs(&e))?;
         Ok(())
     }
 }
@@ -246,12 +397,10 @@ impl SquidexStateMachine {
     /// Apply a log entry to the search state machine
     fn apply_entry(&self, entry: &LogEntry) -> Response {
         match entry {
-            LogEntry::IndexDocument(doc) => {
-                match self.search_machine.index_document(doc.clone()) {
-                    Ok(_) => Response::success(format!("indexed doc {}", doc.id)),
-                    Err(e) => Response::error(format!("failed to index: {}", e)),
-                }
-            }
+            LogEntry::IndexDocument(doc) => match self.search_machine.index_document(doc.clone()) {
+                Ok(_) => Response::success(format!("indexed doc {}", doc.id)),
+                Err(e) => Response::error(format!("failed to index: {}", e)),
+            },
             LogEntry::DeleteDocument(doc_id) => {
                 match self.search_machine.delete_document(*doc_id) {
                     Ok(_) => Response::success(format!("deleted doc {}", doc_id)),
@@ -276,9 +425,7 @@ impl SquidexStateMachine {
                 }
                 Response::success(format!("batch deleted {} docs", deleted))
             }
-            LogEntry::UpdateConfig(_settings) => {
-                Response::success("config updated")
-            }
+            LogEntry::UpdateConfig(_settings) => Response::success("config updated"),
         }
     }
 }
@@ -292,8 +439,8 @@ impl RaftSnapshotBuilder<TypeConfig> for SquidexStateMachine {
 
         // Combine with state machine state
         let combined = SquidexSnapshot::new(snapshot_data);
-        let snapshot_bytes = bincode::serialize(&combined)
-            .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
+        let snapshot_bytes =
+            bincode::serialize(&combined).map_err(|e| StorageIOError::write_snapshot(None, &e))?;
 
         let last_applied = state.last_applied_log;
         let snapshot_id = format!(
@@ -320,7 +467,13 @@ impl RaftStateMachine<TypeConfig> for SquidexStateMachine {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, openraft::BasicNode>), StorageError<NodeId>> {
+    ) -> Result<
+        (
+            Option<LogId<NodeId>>,
+            StoredMembership<NodeId, openraft::BasicNode>,
+        ),
+        StorageError<NodeId>,
+    > {
         let state = self.state.read();
         Ok((state.last_applied_log, state.last_membership.clone()))
     }
@@ -342,7 +495,8 @@ impl RaftStateMachine<TypeConfig> for SquidexStateMachine {
                     responses.push(response);
                 }
                 EntryPayload::Membership(ref membership) => {
-                    state.last_membership = StoredMembership::new(Some(entry.log_id), membership.clone());
+                    state.last_membership =
+                        StoredMembership::new(Some(entry.log_id), membership.clone());
                     responses.push(Response::success("membership change applied"));
                 }
                 EntryPayload::Blank => {
@@ -365,7 +519,9 @@ impl RaftStateMachine<TypeConfig> for SquidexStateMachine {
         }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 

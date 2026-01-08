@@ -58,7 +58,7 @@ impl SquidexNode {
         std::fs::create_dir_all(&data_dir).map_err(SquidexError::Io)?;
 
         // Create log store
-        let log_store = SquidexLogStore::new(data_dir.clone());
+        let log_store = SquidexLogStore::new(data_dir.clone())?;
 
         // Create state machine store
         let sm_store = SquidexStateMachine::new(data_dir.clone(), state_machine.clone());

@@ -2,7 +2,7 @@
 name = "squidex"
 version = "2.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 authors = ["Sacha Arbonel"]
 description = "Production-ready distributed hybrid search engine"
@@ -24,8 +24,8 @@ prost = "0.12"
 hyper = { version = "1.1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 
-# Storage (RocksDB for WAL)
-rocksdb = { version = "0.22", features = ["multi-threaded-cf"] }
+# Storage (Fjall for Raft log)
+fjall = "3.0.1"
 
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
