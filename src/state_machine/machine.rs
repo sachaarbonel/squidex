@@ -1,10 +1,13 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use crossbeam::channel;
+use dashmap::{DashMap, DashSet};
+use ordered_float::OrderedFloat;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::config::IndexSettings;
@@ -25,9 +28,9 @@ pub struct SearchStateMachine {
     hnsw_index: Arc<RwLock<HnswIndex>>,
 
     // Metadata indices for filtering (in-memory)
-    tag_index: RwLock<HashMap<String, HashSet<DocumentId>>>,
-    source_index: RwLock<HashMap<String, HashSet<DocumentId>>>,
-    date_index: RwLock<BTreeMap<u64, HashSet<DocumentId>>>,
+    tag_index: DashMap<String, DashSet<DocumentId>>,
+    source_index: DashMap<String, DashSet<DocumentId>>,
+    date_index: DashMap<u64, DashSet<DocumentId>>,
 
     // Counters and state
     next_doc_id: AtomicU64,
@@ -93,13 +96,38 @@ impl SearchStateMachine {
             settings.clone(),
         );
 
+        let tag_index = DashMap::new();
+        for (tag, ids) in rebuild.tag_index {
+            let set = DashSet::new();
+            for id in ids {
+                set.insert(id);
+            }
+            tag_index.insert(tag, set);
+        }
+        let source_index = DashMap::new();
+        for (source, ids) in rebuild.source_index {
+            let set = DashSet::new();
+            for id in ids {
+                set.insert(id);
+            }
+            source_index.insert(source, set);
+        }
+        let date_index = DashMap::new();
+        for (date, ids) in rebuild.date_index {
+            let set = DashSet::new();
+            for id in ids {
+                set.insert(id);
+            }
+            date_index.insert(date, set);
+        }
+
         Ok(Self {
             doc_store,
             text_index,
             hnsw_index,
-            tag_index: RwLock::new(rebuild.tag_index),
-            source_index: RwLock::new(rebuild.source_index),
-            date_index: RwLock::new(rebuild.date_index),
+            tag_index,
+            source_index,
+            date_index,
             next_doc_id: AtomicU64::new(rebuild.next_doc_id),
             total_documents: AtomicU64::new(rebuild.total_docs),
             index_applied_index,
@@ -438,18 +466,25 @@ impl SearchStateMachine {
 
     fn get_filtered_documents(&self, filter: &Filter) -> HashSet<DocumentId> {
         match filter {
-            Filter::Tag(tag) => self.tag_index.read().get(tag).cloned().unwrap_or_default(),
+            Filter::Tag(tag) => self
+                .tag_index
+                .get(tag)
+                .map(|set| set.iter().map(|id| *id).collect())
+                .unwrap_or_default(),
             Filter::Source(source) => self
                 .source_index
-                .read()
                 .get(source)
-                .cloned()
+                .map(|set| set.iter().map(|id| *id).collect())
                 .unwrap_or_default(),
             Filter::DateRange { start, end } => {
-                let idx = self.date_index.read();
-                idx.range(start..=end)
-                    .flat_map(|(_, ids)| ids.iter().copied())
-                    .collect()
+                let mut ids = HashSet::new();
+                for entry in self.date_index.iter() {
+                    let ts = *entry.key();
+                    if ts >= *start && ts <= *end {
+                        ids.extend(entry.value().iter().map(|id| *id));
+                    }
+                }
+                ids
             }
             Filter::Custom { key, value } => {
                 // Fallback: scan metadata indexes is not available; use doc store
@@ -473,65 +508,104 @@ impl SearchStateMachine {
         scores: HashMap<DocumentId, f32>,
         top_k: usize,
     ) -> Vec<SearchResult> {
-        let mut results: Vec<_> = scores.into_iter().collect();
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(top_k);
+        if top_k == 0 || scores.is_empty() {
+            return Vec::new();
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        struct ScoreEntry {
+            score: OrderedFloat<f32>,
+            doc_id: DocumentId,
+        }
+
+        impl Ord for ScoreEntry {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.score
+                    .cmp(&other.score)
+                    .then_with(|| self.doc_id.cmp(&other.doc_id))
+            }
+        }
+
+        impl PartialOrd for ScoreEntry {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        let mut heap: BinaryHeap<Reverse<ScoreEntry>> = BinaryHeap::new();
+        for (doc_id, score) in scores {
+            let entry = ScoreEntry {
+                score: OrderedFloat(score),
+                doc_id,
+            };
+            if heap.len() < top_k {
+                heap.push(Reverse(entry));
+            } else if let Some(min) = heap.peek() {
+                if entry > min.0 {
+                    heap.pop();
+                    heap.push(Reverse(entry));
+                }
+            }
+        }
+
+        let mut results = Vec::with_capacity(heap.len());
+        while let Some(Reverse(entry)) = heap.pop() {
+            results.push(entry);
+        }
+        results.sort_by(|a, b| b.cmp(a));
         results
             .into_iter()
-            .map(|(doc_id, score)| SearchResult::new(doc_id, score))
+            .map(|entry| SearchResult::new(entry.doc_id, entry.score.0))
             .collect()
     }
 
     fn remove_from_metadata_indices(&self, doc: &Document) {
-        {
-            let mut idx = self.tag_index.write();
-            for tag in &doc.metadata.tags {
-                if let Some(set) = idx.get_mut(tag) {
-                    set.remove(&doc.id);
-                    if set.is_empty() {
-                        idx.remove(tag);
-                    }
+        for tag in &doc.metadata.tags {
+            if let Some(set) = self.tag_index.get(tag) {
+                set.remove(&doc.id);
+                let is_empty = set.len() == 0;
+                drop(set);
+                if is_empty {
+                    self.tag_index.remove(tag);
                 }
             }
         }
         if let Some(source) = &doc.metadata.source {
-            let mut idx = self.source_index.write();
-            if let Some(set) = idx.get_mut(source) {
+            if let Some(set) = self.source_index.get(source) {
                 set.remove(&doc.id);
-                if set.is_empty() {
-                    idx.remove(source);
+                let is_empty = set.len() == 0;
+                drop(set);
+                if is_empty {
+                    self.source_index.remove(source);
                 }
             }
         }
-        {
-            let mut idx = self.date_index.write();
-            if let Some(set) = idx.get_mut(&doc.created_at) {
-                set.remove(&doc.id);
-                if set.is_empty() {
-                    idx.remove(&doc.created_at);
-                }
+        if let Some(set) = self.date_index.get(&doc.created_at) {
+            set.remove(&doc.id);
+            let is_empty = set.len() == 0;
+            drop(set);
+            if is_empty {
+                self.date_index.remove(&doc.created_at);
             }
         }
     }
 
     fn update_metadata_indices(&self, doc: &Document) {
-        {
-            let mut idx = self.tag_index.write();
-            for tag in &doc.metadata.tags {
-                idx.entry(tag.clone()).or_default().insert(doc.id);
-            }
+        for tag in &doc.metadata.tags {
+            self.tag_index
+                .entry(tag.clone())
+                .or_insert_with(DashSet::new)
+                .insert(doc.id);
         }
         if let Some(source) = &doc.metadata.source {
             self.source_index
-                .write()
                 .entry(source.clone())
-                .or_default()
+                .or_insert_with(DashSet::new)
                 .insert(doc.id);
         }
         self.date_index
-            .write()
             .entry(doc.created_at)
-            .or_default()
+            .or_insert_with(DashSet::new)
             .insert(doc.id);
     }
 
@@ -561,13 +635,37 @@ impl SearchStateMachine {
             }
         }
         let hnsw_snapshot = self.hnsw_index.read().create_snapshot();
+        let mut tag_index = HashMap::new();
+        for entry in self.tag_index.iter() {
+            let mut set = HashSet::new();
+            for id in entry.value().iter() {
+                set.insert(*id);
+            }
+            tag_index.insert(entry.key().clone(), set);
+        }
+        let mut source_index = HashMap::new();
+        for entry in self.source_index.iter() {
+            let mut set = HashSet::new();
+            for id in entry.value().iter() {
+                set.insert(*id);
+            }
+            source_index.insert(entry.key().clone(), set);
+        }
+        let mut date_index = BTreeMap::new();
+        for entry in self.date_index.iter() {
+            let mut set = HashSet::new();
+            for id in entry.value().iter() {
+                set.insert(*id);
+            }
+            date_index.insert(*entry.key(), set);
+        }
         let snapshot = SearchSnapshot::new(
             documents,
             HashMap::new(), // inverted index not used anymore
             hnsw_snapshot,
-            self.tag_index.read().clone(),
-            self.source_index.read().clone(),
-            self.date_index.read().clone(),
+            tag_index,
+            source_index,
+            date_index,
             self.next_doc_id.load(Ordering::SeqCst),
             self.total_documents(),
             self.index_version(),
@@ -603,9 +701,7 @@ impl SearchStateMachine {
             &self.hnsw_index,
             &self.tokenizer,
         )?;
-        *self.tag_index.write() = rebuild.tag_index;
-        *self.source_index.write() = rebuild.source_index;
-        *self.date_index.write() = rebuild.date_index;
+        self.replace_metadata_indices(rebuild.tag_index, rebuild.source_index, rebuild.date_index);
         self.next_doc_id
             .store(rebuild.next_doc_id, Ordering::SeqCst);
         self.total_documents
@@ -615,6 +711,40 @@ impl SearchStateMachine {
         self.doc_store
             .set_index_applied_index(rebuild.max_applied)?;
         Ok(())
+    }
+
+    fn replace_metadata_indices(
+        &self,
+        tags: HashMap<String, HashSet<DocumentId>>,
+        sources: HashMap<String, HashSet<DocumentId>>,
+        dates: BTreeMap<u64, HashSet<DocumentId>>,
+    ) {
+        self.tag_index.clear();
+        for (tag, ids) in tags {
+            let set = DashSet::new();
+            for id in ids {
+                set.insert(id);
+            }
+            self.tag_index.insert(tag, set);
+        }
+
+        self.source_index.clear();
+        for (source, ids) in sources {
+            let set = DashSet::new();
+            for id in ids {
+                set.insert(id);
+            }
+            self.source_index.insert(source, set);
+        }
+
+        self.date_index.clear();
+        for (date, ids) in dates {
+            let set = DashSet::new();
+            for id in ids {
+                set.insert(id);
+            }
+            self.date_index.insert(date, set);
+        }
     }
 }
 

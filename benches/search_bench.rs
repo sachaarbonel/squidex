@@ -46,9 +46,7 @@ fn build_env(doc_count: usize, dims: usize) -> BenchEnv {
             .apply_parsed_command(i, Command::IndexDocument(doc))
             .unwrap();
     }
-    machine
-        .wait_for_index(doc_count as u64, 30_000)
-        .unwrap();
+    machine.wait_for_index(doc_count as u64, 30_000).unwrap();
 
     BenchEnv { _tmp: tmp, machine }
 }
@@ -105,12 +103,20 @@ fn bench_hybrid_search(c: &mut Criterion) {
     for (count, env) in envs.iter() {
         group.bench_with_input(BenchmarkId::from_parameter(count), env, |b, env| {
             b.iter(|| {
-                black_box(env.machine.hybrid_search("rust programming", &query, 10, 0.5));
+                black_box(
+                    env.machine
+                        .hybrid_search("rust programming", &query, 10, 0.5),
+                );
             });
         });
     }
     group.finish();
 }
 
-criterion_group!(benches, bench_keyword_search, bench_vector_search, bench_hybrid_search);
+criterion_group!(
+    benches,
+    bench_keyword_search,
+    bench_vector_search,
+    bench_hybrid_search
+);
 criterion_main!(benches);

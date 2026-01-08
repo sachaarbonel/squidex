@@ -15,6 +15,7 @@ use super::statistics::{Bm25Params, IndexStatistics, SegmentStatistics};
 use super::store::SegmentStore;
 use super::types::{DocNo, DocumentId, RaftIndex, SegmentId, Version};
 use super::writer::SegmentWriter;
+use arc_swap::ArcSwap;
 
 /// Search result from the segment index
 #[derive(Clone, Debug)]
@@ -81,7 +82,7 @@ pub struct SegmentIndex {
     /// Mutable buffer for recent writes
     buffer: RwLock<MutableBuffer>,
     /// Immutable segment readers
-    segments: RwLock<Vec<Arc<SegmentReader>>>,
+    segments: ArcSwap<Vec<Arc<SegmentReader>>>,
     /// Segment manifest
     manifest: ManifestHolder,
     /// Index configuration
@@ -95,7 +96,7 @@ impl SegmentIndex {
     pub fn new(config: SegmentIndexConfig) -> Self {
         Self {
             buffer: RwLock::new(MutableBuffer::new()),
-            segments: RwLock::new(Vec::new()),
+            segments: ArcSwap::from_pointee(Vec::new()),
             manifest: ManifestHolder::default(),
             config,
             store: None,
@@ -118,7 +119,7 @@ impl SegmentIndex {
             .unwrap_or_else(|_| SegmentManifest::new());
         let mut index = Self {
             buffer: RwLock::new(MutableBuffer::new()),
-            segments: RwLock::new(Vec::new()),
+            segments: ArcSwap::from_pointee(Vec::new()),
             manifest: ManifestHolder::new(manifest),
             config,
             store: Some(store),
@@ -132,7 +133,7 @@ impl SegmentIndex {
                     segs.push(reader);
                 }
             }
-            *index.segments.write().unwrap() = segs;
+            index.segments.store(Arc::new(segs));
         }
         Ok(index)
     }
@@ -193,8 +194,9 @@ impl SegmentIndex {
         // Add to segments
         let reader = Arc::new(result.reader);
         {
-            let mut segments = self.segments.write().unwrap();
+            let mut segments = self.segments.load().as_ref().clone();
             segments.push(reader.clone());
+            self.segments.store(Arc::new(segments));
         }
 
         // Update manifest
@@ -248,7 +250,7 @@ impl SegmentIndex {
 
         // From segments
         {
-            let segments = self.segments.read().unwrap();
+            let segments = self.segments.load();
             for segment in segments.iter() {
                 for term in query_terms {
                     let df = segment.doc_frequency(term);
@@ -279,7 +281,7 @@ impl SegmentIndex {
 
         // Score segment documents
         {
-            let segments = self.segments.read().unwrap();
+            let segments = self.segments.load();
             for segment in segments.iter() {
                 let segment_scores =
                     self.score_segment(segment, query_terms, &term_dfs, total_docs)?;
@@ -360,7 +362,7 @@ impl SegmentIndex {
 
         // Segment stats
         {
-            let segments = self.segments.read().unwrap();
+            let segments = self.segments.load();
             for segment in segments.iter() {
                 total_docs += segment.live_doc_count();
                 total_length += segment.stats().total_doc_length;
@@ -379,13 +381,7 @@ impl SegmentIndex {
     /// Get total document count (including deleted)
     pub fn total_doc_count(&self) -> u32 {
         let buffer_count = self.buffer.read().unwrap().doc_count();
-        let segment_count: u32 = self
-            .segments
-            .read()
-            .unwrap()
-            .iter()
-            .map(|s| s.doc_count())
-            .sum();
+        let segment_count: u32 = self.segments.load().iter().map(|s| s.doc_count()).sum();
         buffer_count + segment_count
     }
 
@@ -394,8 +390,7 @@ impl SegmentIndex {
         let buffer_count = self.buffer.read().unwrap().live_doc_count();
         let segment_count: u32 = self
             .segments
-            .read()
-            .unwrap()
+            .load()
             .iter()
             .map(|s| s.live_doc_count())
             .sum();
@@ -404,7 +399,7 @@ impl SegmentIndex {
 
     /// Get segment count
     pub fn segment_count(&self) -> usize {
-        self.segments.read().unwrap().len()
+        self.segments.load().len()
     }
 
     /// Get buffer document count
@@ -425,7 +420,7 @@ impl SegmentIndex {
         }
 
         // Check segments
-        let segments = self.segments.read().unwrap();
+        let segments = self.segments.load();
         for segment in segments.iter() {
             // Search through the docno map for this document
             for (docno, entry) in segment.docno_map().live_docs() {
@@ -440,11 +435,11 @@ impl SegmentIndex {
 
     /// Get segments that could be merged
     pub fn get_merge_candidates(&self) -> Vec<Arc<SegmentReader>> {
-        let segments = self.segments.read().unwrap();
+        let segments = self.segments.load();
 
         // Simple policy: merge all segments if we have too many
         if segments.len() > self.config.max_segments {
-            segments.clone()
+            segments.as_ref().clone()
         } else {
             Vec::new()
         }
@@ -463,13 +458,14 @@ impl SegmentIndex {
         }
 
         let merged_segment = Arc::new(merged_result.reader);
-        let mut segments = self.segments.write().unwrap();
+        let mut segments = self.segments.load().as_ref().clone();
 
         // Remove old segments
         segments.retain(|s| !merged_ids.contains(&s.id()));
 
         // Add new segment
         segments.push(merged_segment.clone());
+        self.segments.store(Arc::new(segments));
 
         // Update manifest
         self.manifest.update(|m| {
