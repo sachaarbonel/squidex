@@ -31,6 +31,7 @@ pub struct SearchStateMachine {
     tag_index: DashMap<String, DashSet<DocumentId>>,
     source_index: DashMap<String, DashSet<DocumentId>>,
     date_index: DashMap<u64, DashSet<DocumentId>>,
+    tombstone_index: DashSet<DocumentId>,
 
     // Counters and state
     next_doc_id: AtomicU64,
@@ -55,6 +56,7 @@ struct RebuildOutput {
     tag_index: HashMap<String, HashSet<DocumentId>>,
     source_index: HashMap<String, HashSet<DocumentId>>,
     date_index: BTreeMap<u64, HashSet<DocumentId>>,
+    tombstones: HashSet<DocumentId>,
 }
 
 impl SearchStateMachine {
@@ -120,6 +122,10 @@ impl SearchStateMachine {
             }
             date_index.insert(date, set);
         }
+        let tombstone_index = DashSet::new();
+        for doc_id in rebuild.tombstones {
+            tombstone_index.insert(doc_id);
+        }
 
         Ok(Self {
             doc_store,
@@ -128,6 +134,7 @@ impl SearchStateMachine {
             tag_index,
             source_index,
             date_index,
+            tombstone_index,
             next_doc_id: AtomicU64::new(rebuild.next_doc_id),
             total_documents: AtomicU64::new(rebuild.total_docs),
             index_applied_index,
@@ -192,6 +199,7 @@ impl SearchStateMachine {
             tag_index,
             source_index,
             date_index,
+            tombstones: tombstone_set,
         })
     }
 
@@ -284,6 +292,7 @@ impl SearchStateMachine {
         self.validate_embedding(&doc)?;
         let existed = self.doc_store.exists(doc_id)?;
         self.doc_store.put_document(&doc, raft_index)?;
+        self.tombstone_index.remove(&doc_id);
         self.update_metadata_indices(&doc);
         self.total_documents
             .fetch_add((!existed) as u64, Ordering::SeqCst);
@@ -320,6 +329,7 @@ impl SearchStateMachine {
             self.total_documents.fetch_sub(1, Ordering::SeqCst);
         }
         self.doc_store.tombstone(doc_id, raft_index)?;
+        self.tombstone_index.insert(doc_id);
         self.indexer_tx
             .send(IndexOp::Delete { doc_id, raft_index })
             .map_err(|e| SquidexError::Internal(format!("indexer send failed: {}", e)))?;
@@ -342,19 +352,18 @@ impl SearchStateMachine {
         if query_terms.is_empty() || top_k == 0 {
             return Vec::new();
         }
+        let tombstones = &self.tombstone_index;
         let results = self
             .text_index
-            .keyword_search(&query_terms, top_k * 2)
+            .keyword_search_with_tombstones(&query_terms, top_k * 2, |doc_id| {
+                tombstones.contains(&doc_id)
+            })
             .unwrap_or_default();
-        let mut filtered = Vec::new();
-        for r in results {
-            if self.doc_store.is_tombstoned(r.doc_id).unwrap_or(false) {
-                continue;
-            }
-            filtered.push(SearchResult::new(r.doc_id, r.score));
-        }
-        filtered.truncate(top_k);
-        filtered
+        results
+            .into_iter()
+            .map(|r| SearchResult::new(r.doc_id, r.score))
+            .take(top_k)
+            .collect()
     }
 
     pub fn vector_search(&self, query_embedding: &[f32], top_k: usize) -> Vec<SearchResult> {
@@ -367,6 +376,7 @@ impl SearchStateMachine {
         }
 
         let index = self.hnsw_index.read();
+        let tombstones = &self.tombstone_index;
         // Prefer HNSW path
         if index.len() > 0 && index.is_trained() {
             if let Ok(results) = index.search_with_ef(
@@ -376,7 +386,7 @@ impl SearchStateMachine {
             ) {
                 return results
                     .into_iter()
-                    .filter(|(doc_id, _)| !self.doc_store.is_tombstoned(*doc_id).unwrap_or(false))
+                    .filter(|(doc_id, _)| !tombstones.contains(doc_id))
                     .map(|(doc_id, distance)| {
                         // Convert distance to similarity score
                         let score = 1.0 - distance;
@@ -391,7 +401,7 @@ impl SearchStateMachine {
         let mut scored: Vec<(DocumentId, f32)> = Vec::new();
         if let Ok(ptrs) = self.doc_store.list_doc_pointers() {
             for (doc_id, _) in ptrs {
-                if self.doc_store.is_tombstoned(doc_id).unwrap_or(false) {
+                if tombstones.contains(&doc_id) {
                     continue;
                 }
                 if let Some(doc) = self.doc_store.get_document(doc_id).ok().flatten() {

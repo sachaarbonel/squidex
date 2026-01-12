@@ -225,6 +225,19 @@ impl SegmentIndex {
         query_terms: &[String],
         top_k: usize,
     ) -> io::Result<Vec<SearchResult>> {
+        self.keyword_search_with_tombstones(query_terms, top_k, |_| false)
+    }
+
+    /// Perform BM25+ keyword search with a tombstone predicate
+    pub fn keyword_search_with_tombstones<F>(
+        &self,
+        query_terms: &[String],
+        top_k: usize,
+        is_tombstoned: F,
+    ) -> io::Result<Vec<SearchResult>>
+    where
+        F: Fn(DocumentId) -> bool,
+    {
         if query_terms.is_empty() || top_k == 0 {
             return Ok(Vec::new());
         }
@@ -269,6 +282,9 @@ impl SegmentIndex {
 
             for (docno, score) in buffer_scores {
                 if let Some(entry) = buffer.get_doc_entry(docno) {
+                    if is_tombstoned(entry.doc_id) {
+                        continue;
+                    }
                     let result = SearchResult {
                         doc_id: entry.doc_id,
                         score,
@@ -288,6 +304,9 @@ impl SegmentIndex {
 
                 for (docno, score) in segment_scores {
                     if let Some(doc_id) = segment.get_doc_id(docno) {
+                        if is_tombstoned(doc_id) {
+                            continue;
+                        }
                         let result = SearchResult {
                             doc_id,
                             score,
@@ -618,6 +637,30 @@ mod tests {
 
         // Only one should be searchable now
         let results = index.keyword_search(&["hello".to_string()], 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, 2);
+    }
+
+    #[test]
+    fn test_keyword_search_with_tombstones() {
+        let index = SegmentIndex::default_config();
+
+        let mut tf1 = HashMap::new();
+        tf1.insert("hello".to_string(), 1);
+        index
+            .index_document(1, Version::new(1), tf1, 50, 1)
+            .unwrap();
+
+        let mut tf2 = HashMap::new();
+        tf2.insert("hello".to_string(), 1);
+        index
+            .index_document(2, Version::new(1), tf2, 50, 2)
+            .unwrap();
+
+        let results = index
+            .keyword_search_with_tombstones(&["hello".to_string()], 10, |doc_id| doc_id == 1)
+            .unwrap();
+
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc_id, 2);
     }
