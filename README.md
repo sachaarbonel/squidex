@@ -315,7 +315,7 @@ cargo clippy -- -D warnings
 ### Test Baselines
 
 - Golden search fixtures live in `tests/golden_search.rs` and assert stable keyword/vector/hybrid ordering on a fixed dataset.
-- Benchmarks use Criterion in `benches/search_bench.rs` to capture keyword/vector/hybrid baseline latency trends.
+- Benchmarks use Criterion in `benches/search_bench.rs` for keyword/vector/hybrid latency and `benches/throughput_benchmarks.rs` for write throughput/memory trends.
 - Latest recorded baseline results are in `benches/README.md`.
 
 ## Contributing

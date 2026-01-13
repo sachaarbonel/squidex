@@ -3,6 +3,36 @@
 These baselines are for regression tracking only. Vector and hybrid currently use the brute-force path
 because HNSW codebook training is not wired into the bench harness yet.
 
+## Throughput Benchmarks
+
+The throughput suite lives in `benches/throughput_benchmarks.rs` and focuses on ingest rate and
+snapshot size trends. Add new dated baselines here once you capture stable numbers on representative
+hardware.
+
+### Throughput Baseline
+
+- Date: 2026-01-11
+- Command: `cargo bench --bench throughput_benchmarks`
+- Notes: Criterion sample-time warnings for batch/perf/memory groups; moderate outliers observed. Values below use the median column from Criterion output.
+
+#### Results (median-ish)
+
+| Benchmark | Time | Throughput |
+| --- | --- | --- |
+| single_writes/128 | 12.814 µs | 78.042 Kelem/s |
+| single_writes/384 | 13.863 µs | 72.132 Kelem/s |
+| single_writes/768 | 15.947 µs | 62.708 Kelem/s |
+| batch_writes/10 | 13.536 ms | 738.75 elem/s |
+| batch_writes/100 | 15.239 ms | 6.5623 Kelem/s |
+| batch_writes/1000 | 33.160 ms | 30.157 Kelem/s |
+| sustained_writes/5000_docs | 80.647 ms | 61.999 Kelem/s |
+| performance_profiles/low-latency | 13.772 ms | 7.2610 Kelem/s |
+| performance_profiles/balanced | 14.486 ms | 6.9033 Kelem/s |
+| performance_profiles/high-throughput | 15.306 ms | 6.5334 Kelem/s |
+| memory_overhead/100 | 16.532 ms | n/a (snapshot 0.30 MB, 3187.69 bytes/doc) |
+| memory_overhead/1000 | 37.098 ms | n/a (snapshot 3.04 MB, 3184.37 bytes/doc) |
+| memory_overhead/10000 | 188.82 ms | n/a (snapshot 30.37 MB, 3184.94 bytes/doc) |
+
 ## Latest Baseline
 
 - Date: 2026-01-11

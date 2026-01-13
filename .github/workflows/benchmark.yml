@@ -1,0 +1,57 @@
+name: Benchmark
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine Rust toolchain from Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_TOOLCHAIN="$(awk -F'\"' '/^[[:space:]]*rust-version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
+          if [ -z "${RUST_TOOLCHAIN}" ]; then
+            echo "rust-version not found in Cargo.toml" >&2
+            exit 1
+          fi
+          echo "RUST_TOOLCHAIN=${RUST_TOOLCHAIN}" >> "${GITHUB_ENV}"
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo bench --bench throughput_benchmarks -- --output-format bencher | tee output.txt
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: cargo
+          output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
