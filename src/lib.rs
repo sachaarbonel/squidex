@@ -10,6 +10,9 @@ pub mod state_machine;
 pub mod tokenizer;
 pub mod vector;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 pub use api::{create_router, AppState};
 pub use config::{
     IndexSettings, NodeConfig, PerformanceProfile, ProductQuantizationConfig, TokenizerConfig,

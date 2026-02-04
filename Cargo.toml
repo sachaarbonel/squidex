@@ -75,6 +75,10 @@ arc-swap = "1.6"
 roaring = "0.10"
 ordered-float = "5.1.0"
 
+[features]
+default = []
+testing = []
+
 [build-dependencies]
 tonic-build = "0.11"
 
