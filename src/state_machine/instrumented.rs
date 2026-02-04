@@ -39,10 +39,9 @@ impl InstrumentedStateMachine {
         let doc_id = doc.id;
         let content = doc.content.clone();
 
-        let op_id = self.event_log.record_invoke(OperationType::Index {
-            doc_id,
-            content,
-        });
+        let op_id = self
+            .event_log
+            .record_invoke(OperationType::Index { doc_id, content });
 
         let result = self
             .inner
@@ -120,10 +119,8 @@ impl InstrumentedStateMachine {
         let results = self.inner.keyword_search(query, limit);
         let doc_ids: Vec<_> = results.iter().map(|r| r.doc_id).collect();
 
-        self.event_log.record_return(
-            op_id,
-            OperationResult::SearchSuccess { doc_ids },
-        );
+        self.event_log
+            .record_return(op_id, OperationResult::SearchSuccess { doc_ids });
 
         (op_id, results)
     }
@@ -141,10 +138,8 @@ impl InstrumentedStateMachine {
         let results = self.inner.vector_search(query_embedding, limit);
         let doc_ids: Vec<_> = results.iter().map(|r| r.doc_id).collect();
 
-        self.event_log.record_return(
-            op_id,
-            OperationResult::SearchSuccess { doc_ids },
-        );
+        self.event_log
+            .record_return(op_id, OperationResult::SearchSuccess { doc_ids });
 
         (op_id, results)
     }
@@ -166,10 +161,8 @@ impl InstrumentedStateMachine {
             .hybrid_search(query, query_embedding, limit, keyword_weight);
         let doc_ids: Vec<_> = results.iter().map(|r| r.doc_id).collect();
 
-        self.event_log.record_return(
-            op_id,
-            OperationResult::SearchSuccess { doc_ids },
-        );
+        self.event_log
+            .record_return(op_id, OperationResult::SearchSuccess { doc_ids });
 
         (op_id, results)
     }
@@ -290,9 +283,8 @@ mod tests {
     fn test_instrumented_index_and_get() {
         let temp_dir = TempDir::new().unwrap();
         let settings = create_test_settings();
-        let machine = Arc::new(
-            SearchStateMachine::new(settings, temp_dir.path().to_path_buf()).unwrap(),
-        );
+        let machine =
+            Arc::new(SearchStateMachine::new(settings, temp_dir.path().to_path_buf()).unwrap());
 
         let instrumented = InstrumentedStateMachine::new(machine.clone());
 
@@ -314,9 +306,8 @@ mod tests {
     fn test_instrumented_delete() {
         let temp_dir = TempDir::new().unwrap();
         let settings = create_test_settings();
-        let machine = Arc::new(
-            SearchStateMachine::new(settings, temp_dir.path().to_path_buf()).unwrap(),
-        );
+        let machine =
+            Arc::new(SearchStateMachine::new(settings, temp_dir.path().to_path_buf()).unwrap());
 
         let instrumented = InstrumentedStateMachine::new(machine.clone());
 
@@ -340,9 +331,8 @@ mod tests {
     fn test_instrumented_invariant_check() {
         let temp_dir = TempDir::new().unwrap();
         let settings = create_test_settings();
-        let machine = Arc::new(
-            SearchStateMachine::new(settings, temp_dir.path().to_path_buf()).unwrap(),
-        );
+        let machine =
+            Arc::new(SearchStateMachine::new(settings, temp_dir.path().to_path_buf()).unwrap());
 
         let instrumented = InstrumentedStateMachine::new(machine.clone());
 
@@ -361,6 +351,10 @@ mod tests {
 
         // Check invariants - should pass
         let violations = instrumented.check_default_invariants();
-        assert!(violations.is_empty(), "Expected no violations: {:?}", violations);
+        assert!(
+            violations.is_empty(),
+            "Expected no violations: {:?}",
+            violations
+        );
     }
 }

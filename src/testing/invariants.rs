@@ -105,10 +105,7 @@ impl Invariant for IndexedDocumentRetrievable {
                         deleted.remove(doc_id);
                     }
                 }
-                (
-                    OperationType::Delete { doc_id },
-                    Some(OperationResult::DeleteSuccess { .. }),
-                ) => {
+                (OperationType::Delete { doc_id }, Some(OperationResult::DeleteSuccess { .. })) => {
                     deleted.insert(*doc_id);
                     indexed.remove(doc_id);
                 }
@@ -132,8 +129,7 @@ impl Invariant for IndexedDocumentRetrievable {
         }
 
         // Check: all indexed (non-deleted) docs should have been retrievable
-        let should_be_retrievable: HashSet<_> =
-            indexed.difference(&deleted).copied().collect();
+        let should_be_retrievable: HashSet<_> = indexed.difference(&deleted).copied().collect();
         let not_retrievable: Vec<_> = should_be_retrievable
             .difference(&retrievable)
             .copied()
@@ -200,10 +196,7 @@ impl Invariant for DeletedDocumentNotRetrievable {
                         deleted.remove(doc_id);
                     }
                 }
-                (
-                    OperationType::Delete { doc_id },
-                    Some(OperationResult::DeleteSuccess { .. }),
-                ) => {
+                (OperationType::Delete { doc_id }, Some(OperationResult::DeleteSuccess { .. })) => {
                     deleted.insert(*doc_id);
                 }
                 (
@@ -295,10 +288,7 @@ impl Invariant for MonotonicReads {
                         }
                     }
                 }
-                (
-                    OperationType::Delete { doc_id },
-                    Some(OperationResult::DeleteSuccess { .. }),
-                ) => {
+                (OperationType::Delete { doc_id }, Some(OperationResult::DeleteSuccess { .. })) => {
                     deleted.insert(*doc_id);
                 }
                 (
@@ -419,10 +409,7 @@ impl Invariant for SearchReflectsIndex {
                         deleted.remove(doc_id);
                     }
                 }
-                (
-                    OperationType::Delete { doc_id },
-                    Some(OperationResult::DeleteSuccess { .. }),
-                ) => {
+                (OperationType::Delete { doc_id }, Some(OperationResult::DeleteSuccess { .. })) => {
                     deleted.insert(*doc_id);
                     indexed.remove(doc_id);
                 }
@@ -443,10 +430,8 @@ impl Invariant for SearchReflectsIndex {
                     for doc_id in doc_ids {
                         if deleted.contains(doc_id) {
                             let mut context = HashMap::new();
-                            context.insert(
-                                "deleted_doc_in_results".to_string(),
-                                doc_id.to_string(),
-                            );
+                            context
+                                .insert("deleted_doc_in_results".to_string(), doc_id.to_string());
                             context.insert("search_event_idx".to_string(), idx.to_string());
 
                             return Err(Violation {

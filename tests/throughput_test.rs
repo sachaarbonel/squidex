@@ -78,11 +78,7 @@ fn test_write_throughput_metrics() {
         "Throughput too low: {:.2} writes/sec",
         writes_per_sec
     );
-    assert!(
-        size_mb < 100.0,
-        "Memory usage too high: {:.2} MB",
-        size_mb
-    );
+    assert!(size_mb < 100.0, "Memory usage too high: {:.2} MB", size_mb);
 }
 
 #[test]

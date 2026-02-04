@@ -51,7 +51,5 @@ pub use invariants::{
 pub mod prelude {
     pub use super::events::*;
     pub use super::history::EventLog;
-    pub use super::invariants::{
-        check_all_invariants, default_invariants, Invariant, Violation,
-    };
+    pub use super::invariants::{check_all_invariants, default_invariants, Invariant, Violation};
 }

@@ -90,9 +90,7 @@ fn bench_batch_writes(c: &mut Criterion) {
                                 .apply_parsed_command(doc_id, Command::IndexDocument(doc))
                                 .unwrap();
                         }
-                        machine
-                            .wait_for_index(batch_size as u64, 5_000)
-                            .unwrap();
+                        machine.wait_for_index(batch_size as u64, 5_000).unwrap();
                         black_box(batch_size)
                     },
                     BatchSize::LargeInput,
@@ -153,7 +151,11 @@ fn bench_performance_profiles(c: &mut Criterion) {
     let profiles = [
         (PerformanceProfile::LowLatency, 48usize, "low-latency"),
         (PerformanceProfile::Balanced, 24usize, "balanced"),
-        (PerformanceProfile::HighThroughput, 12usize, "high-throughput"),
+        (
+            PerformanceProfile::HighThroughput,
+            12usize,
+            "high-throughput",
+        ),
     ];
 
     for (profile, subspaces, label) in profiles {
