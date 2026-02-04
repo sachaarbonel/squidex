@@ -6,8 +6,8 @@ use crate::models::{Document, DocumentId, PostingList};
 use crate::vector::HnswSnapshot;
 
 /// Snapshot version for compatibility checking
-/// Bumped to v3 for HnswIndex integration
-pub const SNAPSHOT_VERSION: u32 = 3;
+/// Bumped to v4 for schema/mapping support in IndexSettings
+pub const SNAPSHOT_VERSION: u32 = 4;
 
 /// Complete snapshot of the search state machine
 #[derive(Clone, Serialize, Deserialize)]

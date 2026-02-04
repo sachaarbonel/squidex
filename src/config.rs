@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::models::SimilarityMetric;
+use crate::schema::IndexMapping;
 
 /// Index settings configuration
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -10,6 +11,9 @@ pub struct IndexSettings {
     pub similarity_metric: SimilarityMetric,
     pub tokenizer_config: TokenizerConfig,
     pub pq_config: ProductQuantizationConfig,
+    /// Field mappings (schema)
+    #[serde(default)]
+    pub mapping: IndexMapping,
 }
 
 impl Default for IndexSettings {
@@ -19,6 +23,7 @@ impl Default for IndexSettings {
             similarity_metric: SimilarityMetric::Cosine,
             tokenizer_config: TokenizerConfig::default(),
             pq_config: ProductQuantizationConfig::default(),
+            mapping: IndexMapping::dynamic(), // Default to dynamic mapping
         }
     }
 }

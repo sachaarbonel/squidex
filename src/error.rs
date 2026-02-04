@@ -41,6 +41,22 @@ pub enum SquidexError {
 
     #[error("Vector store not trained")]
     VectorStoreNotTrained,
+
+    #[error("Query parse error: {0}")]
+    QueryParseError(String),
+
+    #[error("Unknown field: {0}")]
+    UnknownField(String),
+
+    #[error("Field type mismatch: field '{field}' is {actual_type}, cannot apply {query_type} query")]
+    FieldTypeMismatch {
+        field: String,
+        actual_type: String,
+        query_type: String,
+    },
+
+    #[error("Schema validation error: {0}")]
+    SchemaValidation(String),
 }
 
 /// Result type alias for Squidex operations

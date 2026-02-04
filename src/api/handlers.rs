@@ -44,6 +44,10 @@ impl IntoResponse for ApiError {
                     SquidexError::Internal(_) => "internal_error",
                     SquidexError::VectorNotFound(_) => "vector_not_found",
                     SquidexError::VectorStoreNotTrained => "vector_store_not_trained",
+                    SquidexError::QueryParseError(_) => "query_parse_error",
+                    SquidexError::UnknownField(_) => "unknown_field",
+                    SquidexError::FieldTypeMismatch { .. } => "field_type_mismatch",
+                    SquidexError::SchemaValidation(_) => "schema_validation_error",
                 };
                 (StatusCode::BAD_REQUEST, error_type, e.to_string())
             }
