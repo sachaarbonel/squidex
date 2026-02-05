@@ -9,6 +9,7 @@ use crate::query::nodes::{
     AllDocsQuery, BoolQuery, FuzzyQuery, MatchQuery, PhraseQuery, PrefixQuery, RangeQuery,
     TermQuery, TermsQuery, WildcardQuery,
 };
+use crate::query::query_string::QueryStringParser;
 use crate::query::types::{MatchOperator, MinimumShouldMatch, RangeBounds, RangeValue};
 use crate::Result;
 use serde_json::{Map, Value};
@@ -87,9 +88,15 @@ impl QueryParser {
         if let Some(phrase_query) = map.get("match_phrase") {
             return Self::parse_match_phrase(phrase_query);
         }
+        if let Some(qs) = map.get("query_string") {
+            return Self::parse_query_string(qs);
+        }
+        if let Some(sqs) = map.get("simple_query_string") {
+            return Self::parse_simple_query_string(sqs);
+        }
 
         Err(SquidexError::InvalidRequest(format!(
-            "Unknown query type. Expected one of: bool, match, match_all, match_phrase, term, terms, range, wildcard, prefix, fuzzy. Got keys: {:?}",
+            "Unknown query type. Expected one of: bool, match, match_all, match_phrase, term, terms, range, wildcard, prefix, fuzzy, query_string, simple_query_string. Got keys: {:?}",
             map.keys().collect::<Vec<_>>()
         )))
     }
@@ -556,6 +563,97 @@ impl QueryParser {
 
         Ok(Box::new(query))
     }
+
+    /// Parse a query_string query (Lucene syntax)
+    ///
+    /// Format: { "query_string": { "query": "title:rust AND tags:tutorial", "default_field": "content" } }
+    fn parse_query_string(value: &Value) -> Result<Box<dyn QueryNode>> {
+        let map = value.as_object().ok_or_else(|| {
+            SquidexError::InvalidRequest("query_string must be an object".to_string())
+        })?;
+
+        let query_text = map
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SquidexError::InvalidRequest(
+                    "query_string must have 'query' field".to_string(),
+                )
+            })?;
+
+        let default_field = map
+            .get("default_field")
+            .and_then(|v| v.as_str())
+            .unwrap_or("content");
+
+        let default_operator = map
+            .get("default_operator")
+            .and_then(|v| v.as_str())
+            .unwrap_or("OR");
+
+        let mut parser = QueryStringParser::new(query_text)?
+            .with_default_field(default_field);
+
+        if default_operator.eq_ignore_ascii_case("AND") {
+            parser = parser.with_default_operator(MatchOperator::And);
+        }
+
+        parser.parse()
+    }
+
+    /// Parse a simple_query_string query (simplified syntax, more forgiving)
+    ///
+    /// Format: { "simple_query_string": { "query": "+rust -draft", "fields": ["title", "content"] } }
+    ///
+    /// Supported operators:
+    /// - `+` prefix: term must be present
+    /// - `-` prefix: term must not be present
+    /// - `"..."`: phrase query
+    /// - `*`: suffix wildcard
+    /// - `|`: OR operator
+    fn parse_simple_query_string(value: &Value) -> Result<Box<dyn QueryNode>> {
+        let map = value.as_object().ok_or_else(|| {
+            SquidexError::InvalidRequest("simple_query_string must be an object".to_string())
+        })?;
+
+        let query_text = map
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SquidexError::InvalidRequest(
+                    "simple_query_string must have 'query' field".to_string(),
+                )
+            })?;
+
+        let default_field = map
+            .get("default_field")
+            .and_then(|v| v.as_str())
+            .unwrap_or("content");
+
+        // For simple_query_string, we use a more lenient parsing approach
+        // Convert simple syntax to our query string format
+        let converted = Self::convert_simple_query_syntax(query_text);
+
+        let mut parser = QueryStringParser::new(&converted)?
+            .with_default_field(default_field);
+
+        // simple_query_string is more forgiving - wrap in try and return match_all on error
+        match parser.parse() {
+            Ok(q) => Ok(q),
+            Err(_) => {
+                // Fall back to a simple match query
+                Ok(Box::new(MatchQuery::new(default_field, query_text)))
+            }
+        }
+    }
+
+    /// Convert simple query syntax to full query string syntax
+    fn convert_simple_query_syntax(input: &str) -> String {
+        // Replace | with OR
+        let result = input.replace(" | ", " OR ");
+        // The rest (+, -, "", *) are already supported by our parser
+        result
+    }
 }
 
 #[cfg(test)]
@@ -788,6 +886,56 @@ mod tests {
                 ],
                 "must_not": [
                     { "wildcard": { "status": "draft*" } }
+                ]
+            }
+        }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "bool");
+    }
+
+    #[test]
+    fn test_parse_query_string() {
+        let json = r#"{ "query_string": { "query": "title:rust AND status:published" } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "bool");
+    }
+
+    #[test]
+    fn test_parse_query_string_with_default_field() {
+        let json = r#"{ "query_string": { "query": "rust programming", "default_field": "content" } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        // Single term without explicit AND becomes a term query
+        assert!(query.query_type() == "term" || query.query_type() == "bool");
+    }
+
+    #[test]
+    fn test_parse_query_string_complex() {
+        let json = r#"{
+            "query_string": {
+                "query": "(title:rust OR title:python) AND status:published NOT draft",
+                "default_operator": "AND"
+            }
+        }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "bool");
+    }
+
+    #[test]
+    fn test_parse_simple_query_string() {
+        let json = r#"{ "simple_query_string": { "query": "+rust -draft" } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "bool");
+    }
+
+    #[test]
+    fn test_parse_query_string_in_bool() {
+        let json = r#"{
+            "bool": {
+                "must": [
+                    { "query_string": { "query": "title:rust" } }
+                ],
+                "filter": [
+                    { "range": { "year": { "gte": 2024 } } }
                 ]
             }
         }"#;

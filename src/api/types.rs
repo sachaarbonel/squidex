@@ -23,32 +23,60 @@ pub struct IndexResponse {
 }
 
 /// Search request
+///
+/// Uses Elasticsearch-compatible Query DSL. All queries go through the `query` field.
+///
+/// # Examples
+///
+/// Simple match query:
+/// ```json
+/// { "query": { "match": { "content": "rust programming" } } }
+/// ```
+///
+/// Lucene-style query string:
+/// ```json
+/// { "query": { "query_string": { "query": "title:rust AND tags:tutorial" } } }
+/// ```
+///
+/// Complex bool query:
+/// ```json
+/// {
+///   "query": {
+///     "bool": {
+///       "must": [{ "match": { "content": "rust" } }],
+///       "filter": [{ "range": { "year": { "gte": 2024 } } }]
+///     }
+///   }
+/// }
+/// ```
+///
+/// Hybrid search (text + vector):
+/// ```json
+/// {
+///   "query": { "match": { "content": "rust" } },
+///   "embedding": [0.1, 0.2, ...],
+///   "keyword_weight": 0.7
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchRequestApi {
-    pub query: Option<String>,
-    pub embedding: Option<Vec<f32>>,
+    /// Query DSL (required)
+    pub query: serde_json::Value,
+    /// Optional embedding for hybrid search
     #[serde(default)]
-    pub mode: SearchModeApi,
+    pub embedding: Option<Vec<f32>>,
+    /// Weight for keyword vs vector scoring (0.0 = vector only, 1.0 = keyword only)
     #[serde(default = "default_keyword_weight")]
     pub keyword_weight: f32,
+    /// Number of results to return
     #[serde(default = "default_top_k")]
     pub top_k: usize,
-    #[serde(default)]
-    pub filters: Vec<Filter>,
+    /// Minimum index version to wait for (consistency)
     #[serde(default)]
     pub min_index_applied_index: Option<u64>,
+    /// Timeout in ms to wait for index version
     #[serde(default)]
-    pub wait_for: Option<u64>, // optional wait_for milliseconds until index_applied_index >= min
-    /// Query DSL for structured queries (optional, overrides query/mode if present)
-    #[serde(default)]
-    pub dsl: Option<serde_json::Value>,
-    /// Lucene-style query string (e.g., "title:rust AND tags:tutorial")
-    /// Takes precedence over `dsl` and `query` if provided
-    #[serde(default)]
-    pub query_string: Option<String>,
-    /// Default field for unqualified terms in query_string (default: "content")
-    #[serde(default)]
-    pub default_field: Option<String>,
+    pub wait_for: Option<u64>,
 }
 
 fn default_keyword_weight() -> f32 {
@@ -57,20 +85,6 @@ fn default_keyword_weight() -> f32 {
 
 fn default_top_k() -> usize {
     10
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SearchModeApi {
-    Keyword,
-    Vector,
-    Hybrid,
-}
-
-impl Default for SearchModeApi {
-    fn default() -> Self {
-        Self::Hybrid
-    }
 }
 
 /// Search response

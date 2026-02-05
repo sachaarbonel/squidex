@@ -510,6 +510,45 @@ impl SearchStateMachine {
         self.collect_top_k_results(combined, top_k)
     }
 
+    /// Hybrid search combining a parsed DSL query with vector search
+    pub fn hybrid_search_with_query(
+        &self,
+        query: Box<dyn QueryNode>,
+        query_embedding: &[f32],
+        top_k: usize,
+        keyword_weight: f32,
+    ) -> Vec<SearchResult> {
+        if top_k == 0 {
+            return Vec::new();
+        }
+        let vector_weight = 1.0 - keyword_weight;
+
+        // Execute structured query for keyword results
+        let keyword_results = self.structured_search(query, top_k * 2);
+        let vector_results = self.vector_search(query_embedding, top_k * 2);
+
+        let keyword_max = keyword_results
+            .iter()
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
+        let vector_max = vector_results
+            .iter()
+            .map(|r| r.score)
+            .fold(0.0f32, f32::max);
+
+        let mut combined: HashMap<DocumentId, f32> = HashMap::new();
+        for r in keyword_results {
+            let normalized = normalize_score(r.score, keyword_max);
+            *combined.entry(r.doc_id).or_insert(0.0) += normalized * keyword_weight;
+        }
+        for r in vector_results {
+            let normalized = normalize_score(r.score, vector_max);
+            *combined.entry(r.doc_id).or_insert(0.0) += normalized * vector_weight;
+        }
+
+        self.collect_top_k_results(combined, top_k)
+    }
+
     pub fn apply_filters(&self, doc_ids: &mut HashSet<DocumentId>, filters: &[Filter]) {
         if filters.is_empty() {
             return;

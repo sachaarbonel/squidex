@@ -105,37 +105,85 @@ impl QueryStringParser {
     }
 
     /// Parse: and_expr := not_expr (AND? not_expr)*
+    ///
+    /// When default_operator is OR, adjacent terms (without explicit AND) are collected
+    /// and combined with OR. When default_operator is AND, they're combined with AND.
     fn parse_and_expr(&mut self) -> Result<Box<dyn QueryNode>> {
-        let mut clauses = vec![self.parse_not_expr()?];
+        let mut explicit_and_clauses = vec![self.parse_not_expr()?];
+        let mut implicit_clauses: Vec<Box<dyn QueryNode>> = vec![];
 
         loop {
-            // Explicit AND
+            // Explicit AND - always combine with must
             if self.current_token == Token::And {
                 self.advance()?;
-                clauses.push(self.parse_not_expr()?);
+                // If we had implicit clauses, they need to be combined first
+                if !implicit_clauses.is_empty() {
+                    let last = explicit_and_clauses.pop().unwrap();
+                    implicit_clauses.insert(0, last);
+                    let combined = self.combine_with_default_operator(implicit_clauses);
+                    explicit_and_clauses.push(combined);
+                    implicit_clauses = vec![];
+                }
+                explicit_and_clauses.push(self.parse_not_expr()?);
             }
-            // Implicit AND when next token is NOT or a primary expression
-            else if self.current_token == Token::Not
-                || self.current_token == Token::Minus
-                || (self.default_operator == MatchOperator::And && self.is_start_of_primary())
-            {
-                clauses.push(self.parse_not_expr()?);
+            // Implicit combination when next token is NOT/Minus or a primary expression
+            else if self.current_token == Token::Not || self.current_token == Token::Minus {
+                // NOT/Minus always starts a new clause that gets AND-ed
+                explicit_and_clauses.push(self.parse_not_expr()?);
+            }
+            // Implicit combination for adjacent terms (based on default_operator)
+            else if self.is_start_of_primary() {
+                implicit_clauses.push(self.parse_not_expr()?);
             } else {
                 break;
             }
         }
 
-        if clauses.len() == 1 {
-            Ok(clauses.into_iter().next().unwrap())
+        // Combine any remaining implicit clauses with the last explicit clause
+        if !implicit_clauses.is_empty() {
+            let last = explicit_and_clauses.pop().unwrap();
+            implicit_clauses.insert(0, last);
+            let combined = self.combine_with_default_operator(implicit_clauses);
+            explicit_and_clauses.push(combined);
+        }
+
+        if explicit_and_clauses.len() == 1 {
+            Ok(explicit_and_clauses.into_iter().next().unwrap())
         } else {
             Ok(Box::new(BoolQuery {
-                must: clauses,
+                must: explicit_and_clauses,
                 should: vec![],
                 must_not: vec![],
                 filter: vec![],
                 minimum_should_match: Default::default(),
                 boost: 1.0,
             }))
+        }
+    }
+
+    /// Combine clauses using the default operator (AND -> must, OR -> should)
+    fn combine_with_default_operator(&self, clauses: Vec<Box<dyn QueryNode>>) -> Box<dyn QueryNode> {
+        if clauses.len() == 1 {
+            return clauses.into_iter().next().unwrap();
+        }
+
+        match self.default_operator {
+            MatchOperator::And => Box::new(BoolQuery {
+                must: clauses,
+                should: vec![],
+                must_not: vec![],
+                filter: vec![],
+                minimum_should_match: Default::default(),
+                boost: 1.0,
+            }),
+            MatchOperator::Or => Box::new(BoolQuery {
+                must: vec![],
+                should: clauses,
+                must_not: vec![],
+                filter: vec![],
+                minimum_should_match: Default::default(),
+                boost: 1.0,
+            }),
         }
     }
 
@@ -594,6 +642,24 @@ mod tests {
             .with_default_operator(MatchOperator::And)
             .parse()
             .unwrap();
+        assert_eq!(query.query_type(), "bool");
+    }
+
+    #[test]
+    fn test_default_operator_or() {
+        // Default operator is OR, so "rust programming" becomes a bool with should clauses
+        let query = QueryStringParser::new("rust programming")
+            .unwrap()
+            .with_default_operator(MatchOperator::Or)
+            .parse()
+            .unwrap();
+        assert_eq!(query.query_type(), "bool");
+    }
+
+    #[test]
+    fn test_implicit_or_with_default() {
+        // Default operator is OR by default
+        let query = parse_query("rust programming").unwrap();
         assert_eq!(query.query_type(), "bool");
     }
 

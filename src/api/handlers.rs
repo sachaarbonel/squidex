@@ -144,13 +144,14 @@ pub async fn delete_document(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Search documents
+/// Search documents using Query DSL
 pub async fn search(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SearchRequestApi>,
 ) -> Result<impl IntoResponse, ApiError> {
     let start = std::time::Instant::now();
 
+    // Wait for index consistency if requested
     if let Some(min_applied) = req.min_index_applied_index {
         let wait_ms = req.wait_for.unwrap_or(0);
         if state.state_machine.index_version() < min_applied {
@@ -167,54 +168,22 @@ pub async fn search(
         }
     }
 
-    // Priority: query_string > dsl > legacy modes
-    let results = if let Some(qs) = &req.query_string {
-        // Parse Lucene-style query string
-        let mut parser = crate::query::QueryStringParser::new(qs)
-            .map_err(|e| ApiError::BadRequest(format!("Invalid query string: {}", e)))?;
+    // Parse Query DSL
+    let query = crate::query::QueryParser::parse(&req.query)
+        .map_err(|e| ApiError::BadRequest(format!("Invalid query: {}", e)))?;
 
-        // Apply default field if specified
-        if let Some(default_field) = &req.default_field {
-            parser = parser.with_default_field(default_field.clone());
-        }
-
-        let query = parser
-            .parse()
-            .map_err(|e| ApiError::BadRequest(format!("Query string parse error: {}", e)))?;
-
-        state.state_machine.structured_search(query, req.top_k)
-    } else if let Some(dsl) = &req.dsl {
-        // Parse JSON DSL query
-        let query = crate::query::QueryParser::parse(dsl)
-            .map_err(|e| ApiError::BadRequest(format!("Invalid DSL query: {}", e)))?;
-        state.state_machine.structured_search(query, req.top_k)
+    // Execute search
+    let results = if let Some(embedding) = &req.embedding {
+        // Hybrid search: combine keyword + vector
+        state.state_machine.hybrid_search_with_query(
+            query,
+            embedding,
+            req.top_k,
+            req.keyword_weight,
+        )
     } else {
-        // Fall back to existing search modes
-        match req.mode {
-            SearchModeApi::Keyword => {
-                let query = req.query.ok_or_else(|| {
-                    ApiError::BadRequest("query required for keyword search".to_string())
-                })?;
-                state.state_machine.keyword_search(&query, req.top_k)
-            }
-            SearchModeApi::Vector => {
-                let embedding = req.embedding.ok_or_else(|| {
-                    ApiError::BadRequest("embedding required for vector search".to_string())
-                })?;
-                state.state_machine.vector_search(&embedding, req.top_k)
-            }
-            SearchModeApi::Hybrid => {
-                let query = req.query.ok_or_else(|| {
-                    ApiError::BadRequest("query required for hybrid search".to_string())
-                })?;
-                let embedding = req.embedding.ok_or_else(|| {
-                    ApiError::BadRequest("embedding required for hybrid search".to_string())
-                })?;
-                state
-                    .state_machine
-                    .hybrid_search(&query, &embedding, req.top_k, req.keyword_weight)
-            }
-        }
+        // Keyword-only search using DSL
+        state.state_machine.structured_search(query, req.top_k)
     };
 
     let response = types::SearchResponse {
