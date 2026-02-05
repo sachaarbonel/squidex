@@ -42,6 +42,13 @@ pub struct SearchRequestApi {
     /// Query DSL for structured queries (optional, overrides query/mode if present)
     #[serde(default)]
     pub dsl: Option<serde_json::Value>,
+    /// Lucene-style query string (e.g., "title:rust AND tags:tutorial")
+    /// Takes precedence over `dsl` and `query` if provided
+    #[serde(default)]
+    pub query_string: Option<String>,
+    /// Default field for unqualified terms in query_string (default: "content")
+    #[serde(default)]
+    pub default_field: Option<String>,
 }
 
 fn default_keyword_weight() -> f32 {

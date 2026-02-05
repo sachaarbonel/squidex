@@ -160,6 +160,34 @@ impl SegmentIndex {
         Ok(docno)
     }
 
+    /// Index a document with term positions (for phrase queries)
+    pub fn index_document_with_positions(
+        &self,
+        doc_id: DocumentId,
+        version: Version,
+        term_positions: HashMap<String, Vec<u32>>,
+        doc_len: u32,
+        raft_index: RaftIndex,
+    ) -> io::Result<DocNo> {
+        let mut buffer = self.buffer.write().unwrap();
+        let docno = buffer.index_document_with_positions(
+            doc_id,
+            version,
+            term_positions,
+            doc_len,
+            None,
+            raft_index,
+        );
+
+        // Check if we need to flush
+        if buffer.should_flush(&self.config.buffer) {
+            drop(buffer);
+            self.flush()?;
+        }
+
+        Ok(docno)
+    }
+
     /// Delete a document
     pub fn delete_document(&self, doc_id: DocumentId, raft_index: RaftIndex) -> bool {
         let mut buffer = self.buffer.write().unwrap();

@@ -27,6 +27,39 @@ pub struct PostingEntry {
     pub doc_length: u32,
     /// External document ID
     pub doc_id: DocumentId,
+    /// Term positions within the document (for phrase queries)
+    /// Empty if positions are not stored
+    pub positions: Vec<u32>,
+}
+
+impl PostingEntry {
+    /// Create a new posting entry without positions
+    pub fn new(docno: DocNo, term_frequency: u32, doc_length: u32, doc_id: DocumentId) -> Self {
+        Self {
+            docno,
+            term_frequency,
+            doc_length,
+            doc_id,
+            positions: Vec::new(),
+        }
+    }
+
+    /// Create a new posting entry with positions
+    pub fn with_positions(
+        docno: DocNo,
+        term_frequency: u32,
+        doc_length: u32,
+        doc_id: DocumentId,
+        positions: Vec<u32>,
+    ) -> Self {
+        Self {
+            docno,
+            term_frequency,
+            doc_length,
+            doc_id,
+            positions,
+        }
+    }
 }
 
 /// Trait for accessing posting lists from index
@@ -137,12 +170,12 @@ impl IndexAccessor for SegmentAccessor {
                         continue;
                     }
                     let doc_length = buffer_guard.stats().get_doc_length(posting.docno).unwrap_or(0);
-                    entries.push(PostingEntry {
-                        docno: posting.docno,
-                        term_frequency: posting.term_frequency,
+                    entries.push(PostingEntry::new(
+                        posting.docno,
+                        posting.term_frequency,
                         doc_length,
-                        doc_id: entry.doc_id,
-                    });
+                        entry.doc_id,
+                    ));
                 }
             }
         }
@@ -161,12 +194,7 @@ impl IndexAccessor for SegmentAccessor {
                             continue;
                         }
                         let doc_length = segment.get_doc_length(docno).unwrap_or(0);
-                        entries.push(PostingEntry {
-                            docno,
-                            term_frequency: tf,
-                            doc_length,
-                            doc_id,
-                        });
+                        entries.push(PostingEntry::new(docno, tf, doc_length, doc_id));
                     }
                 }
             }
@@ -280,15 +308,19 @@ mod tests {
 
     #[test]
     fn test_posting_entry() {
-        let entry = PostingEntry {
-            docno: DocNo::new(0),
-            term_frequency: 5,
-            doc_length: 100,
-            doc_id: 42,
-        };
+        let entry = PostingEntry::new(DocNo::new(0), 5, 100, 42);
         assert_eq!(entry.docno.as_u32(), 0);
         assert_eq!(entry.term_frequency, 5);
         assert_eq!(entry.doc_length, 100);
         assert_eq!(entry.doc_id, 42);
+        assert!(entry.positions.is_empty());
+    }
+
+    #[test]
+    fn test_posting_entry_with_positions() {
+        let entry = PostingEntry::with_positions(DocNo::new(0), 3, 100, 42, vec![0, 5, 10]);
+        assert_eq!(entry.docno.as_u32(), 0);
+        assert_eq!(entry.term_frequency, 3);
+        assert_eq!(entry.positions, vec![0, 5, 10]);
     }
 }

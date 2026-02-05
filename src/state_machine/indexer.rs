@@ -39,13 +39,18 @@ pub fn spawn_indexer(
         while let Ok(op) = rx.recv() {
             match op {
                 IndexOp::Upsert { doc, raft_index } => {
-                    // Text indexing
-                    let term_freqs = tokenizer.compute_term_frequencies(&doc.content);
-                    let doc_len = tokenizer.tokenize(&doc.content).len() as u32;
+                    // Text indexing with positions (for phrase queries)
+                    let term_positions = tokenizer.tokenize_with_positions(&doc.content);
+                    let doc_len = term_positions.values().map(|v| v.len()).sum::<usize>() as u32;
                     // Version derived from updated_at for now
                     let version = Version::new(doc.updated_at);
-                    let _ =
-                        text_index.index_document(doc.id, version, term_freqs, doc_len, raft_index);
+                    let _ = text_index.index_document_with_positions(
+                        doc.id,
+                        version,
+                        term_positions,
+                        doc_len,
+                        raft_index,
+                    );
 
                     // Vector indexing
                     {

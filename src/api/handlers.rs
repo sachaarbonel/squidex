@@ -167,8 +167,24 @@ pub async fn search(
         }
     }
 
-    // If DSL is provided, use structured search
-    let results = if let Some(dsl) = &req.dsl {
+    // Priority: query_string > dsl > legacy modes
+    let results = if let Some(qs) = &req.query_string {
+        // Parse Lucene-style query string
+        let mut parser = crate::query::QueryStringParser::new(qs)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid query string: {}", e)))?;
+
+        // Apply default field if specified
+        if let Some(default_field) = &req.default_field {
+            parser = parser.with_default_field(default_field.clone());
+        }
+
+        let query = parser
+            .parse()
+            .map_err(|e| ApiError::BadRequest(format!("Query string parse error: {}", e)))?;
+
+        state.state_machine.structured_search(query, req.top_k)
+    } else if let Some(dsl) = &req.dsl {
+        // Parse JSON DSL query
         let query = crate::query::QueryParser::parse(dsl)
             .map_err(|e| ApiError::BadRequest(format!("Invalid DSL query: {}", e)))?;
         state.state_machine.structured_search(query, req.top_k)

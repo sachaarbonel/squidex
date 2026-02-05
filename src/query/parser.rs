@@ -5,7 +5,10 @@
 
 use crate::error::SquidexError;
 use crate::query::ast::QueryNode;
-use crate::query::nodes::*;
+use crate::query::nodes::{
+    AllDocsQuery, BoolQuery, FuzzyQuery, MatchQuery, PhraseQuery, PrefixQuery, RangeQuery,
+    TermQuery, TermsQuery, WildcardQuery,
+};
 use crate::query::types::{MatchOperator, MinimumShouldMatch, RangeBounds, RangeValue};
 use crate::Result;
 use serde_json::{Map, Value};
@@ -72,9 +75,21 @@ impl QueryParser {
         if let Some(range_query) = map.get("range") {
             return Self::parse_range(range_query);
         }
+        if let Some(wildcard_query) = map.get("wildcard") {
+            return Self::parse_wildcard(wildcard_query);
+        }
+        if let Some(prefix_query) = map.get("prefix") {
+            return Self::parse_prefix(prefix_query);
+        }
+        if let Some(fuzzy_query) = map.get("fuzzy") {
+            return Self::parse_fuzzy(fuzzy_query);
+        }
+        if let Some(phrase_query) = map.get("match_phrase") {
+            return Self::parse_match_phrase(phrase_query);
+        }
 
         Err(SquidexError::InvalidRequest(format!(
-            "Unknown query type. Expected one of: bool, match, match_all, term, terms, range. Got keys: {:?}",
+            "Unknown query type. Expected one of: bool, match, match_all, match_phrase, term, terms, range, wildcard, prefix, fuzzy. Got keys: {:?}",
             map.keys().collect::<Vec<_>>()
         )))
     }
@@ -355,6 +370,192 @@ impl QueryParser {
             _ => RangeValue::String(value.to_string()),
         }
     }
+
+    /// Parse a wildcard query
+    ///
+    /// Format: { "wildcard": { "field": "pattern*" } }
+    /// or: { "wildcard": { "field": { "value": "pattern*", "boost": 1.5 } } }
+    fn parse_wildcard(value: &Value) -> Result<Box<dyn QueryNode>> {
+        let map = value.as_object().ok_or_else(|| {
+            SquidexError::InvalidRequest("wildcard query must be an object".to_string())
+        })?;
+
+        let (field, wildcard_spec) = map.iter().next().ok_or_else(|| {
+            SquidexError::InvalidRequest("wildcard query must specify a field".to_string())
+        })?;
+
+        let (pattern, boost) = match wildcard_spec {
+            Value::String(p) => (p.clone(), 1.0),
+            Value::Object(spec) => {
+                let pattern = spec
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        SquidexError::InvalidRequest(
+                            "wildcard query spec must have 'value' field".to_string(),
+                        )
+                    })?
+                    .to_string();
+                let boost = spec.get("boost").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                (pattern, boost)
+            }
+            _ => {
+                return Err(SquidexError::InvalidRequest(
+                    "wildcard query value must be a string or object".to_string(),
+                ))
+            }
+        };
+
+        Ok(Box::new(WildcardQuery::new(field.clone(), pattern).with_boost(boost)))
+    }
+
+    /// Parse a prefix query
+    ///
+    /// Format: { "prefix": { "field": "prefix" } }
+    /// or: { "prefix": { "field": { "value": "prefix", "boost": 1.5 } } }
+    fn parse_prefix(value: &Value) -> Result<Box<dyn QueryNode>> {
+        let map = value.as_object().ok_or_else(|| {
+            SquidexError::InvalidRequest("prefix query must be an object".to_string())
+        })?;
+
+        let (field, prefix_spec) = map.iter().next().ok_or_else(|| {
+            SquidexError::InvalidRequest("prefix query must specify a field".to_string())
+        })?;
+
+        let (prefix, boost) = match prefix_spec {
+            Value::String(p) => (p.clone(), 1.0),
+            Value::Object(spec) => {
+                let prefix = spec
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        SquidexError::InvalidRequest(
+                            "prefix query spec must have 'value' field".to_string(),
+                        )
+                    })?
+                    .to_string();
+                let boost = spec.get("boost").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                (prefix, boost)
+            }
+            _ => {
+                return Err(SquidexError::InvalidRequest(
+                    "prefix query value must be a string or object".to_string(),
+                ))
+            }
+        };
+
+        Ok(Box::new(PrefixQuery::new(field.clone(), prefix).with_boost(boost)))
+    }
+
+    /// Parse a fuzzy query
+    ///
+    /// Format: { "fuzzy": { "field": "term" } }
+    /// or: { "fuzzy": { "field": { "value": "term", "fuzziness": 2, "prefix_length": 0, "boost": 1.0 } } }
+    fn parse_fuzzy(value: &Value) -> Result<Box<dyn QueryNode>> {
+        let map = value.as_object().ok_or_else(|| {
+            SquidexError::InvalidRequest("fuzzy query must be an object".to_string())
+        })?;
+
+        let (field, fuzzy_spec) = map.iter().next().ok_or_else(|| {
+            SquidexError::InvalidRequest("fuzzy query must specify a field".to_string())
+        })?;
+
+        let mut query = match fuzzy_spec {
+            Value::String(term) => FuzzyQuery::new(field.clone(), term.clone()),
+            Value::Object(spec) => {
+                let term = spec
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        SquidexError::InvalidRequest(
+                            "fuzzy query spec must have 'value' field".to_string(),
+                        )
+                    })?
+                    .to_string();
+
+                let mut q = FuzzyQuery::new(field.clone(), term);
+
+                if let Some(fuzziness) = spec.get("fuzziness") {
+                    if let Some(f) = fuzziness.as_u64() {
+                        q = q.with_fuzziness(f as u32);
+                    } else if fuzziness.as_str() == Some("AUTO") {
+                        // AUTO fuzziness: based on term length
+                        // 0-2 chars: 0, 3-5 chars: 1, >5 chars: 2
+                        q = q.with_fuzziness(2);
+                    }
+                }
+
+                if let Some(prefix_length) = spec.get("prefix_length").and_then(|v| v.as_u64()) {
+                    q = q.with_prefix_length(prefix_length as usize);
+                }
+
+                if let Some(max_exp) = spec.get("max_expansions").and_then(|v| v.as_u64()) {
+                    q = q.with_max_expansions(max_exp as usize);
+                }
+
+                if let Some(boost) = spec.get("boost").and_then(|v| v.as_f64()) {
+                    q = q.with_boost(boost as f32);
+                }
+
+                q
+            }
+            _ => {
+                return Err(SquidexError::InvalidRequest(
+                    "fuzzy query value must be a string or object".to_string(),
+                ))
+            }
+        };
+
+        Ok(Box::new(query))
+    }
+
+    /// Parse a match_phrase query
+    ///
+    /// Format: { "match_phrase": { "field": "exact phrase" } }
+    /// or: { "match_phrase": { "field": { "query": "exact phrase", "slop": 0, "boost": 1.0 } } }
+    fn parse_match_phrase(value: &Value) -> Result<Box<dyn QueryNode>> {
+        let map = value.as_object().ok_or_else(|| {
+            SquidexError::InvalidRequest("match_phrase query must be an object".to_string())
+        })?;
+
+        let (field, phrase_spec) = map.iter().next().ok_or_else(|| {
+            SquidexError::InvalidRequest("match_phrase query must specify a field".to_string())
+        })?;
+
+        let query = match phrase_spec {
+            Value::String(phrase) => PhraseQuery::new(field.clone(), phrase.clone()),
+            Value::Object(spec) => {
+                let phrase = spec
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        SquidexError::InvalidRequest(
+                            "match_phrase query spec must have 'query' field".to_string(),
+                        )
+                    })?
+                    .to_string();
+
+                let mut q = PhraseQuery::new(field.clone(), phrase);
+
+                if let Some(slop) = spec.get("slop").and_then(|v| v.as_u64()) {
+                    q = q.with_slop(slop as u32);
+                }
+
+                if let Some(boost) = spec.get("boost").and_then(|v| v.as_f64()) {
+                    q = q.with_boost(boost as f32);
+                }
+
+                q
+            }
+            _ => {
+                return Err(SquidexError::InvalidRequest(
+                    "match_phrase query value must be a string or object".to_string(),
+                ))
+            }
+        };
+
+        Ok(Box::new(query))
+    }
 }
 
 #[cfg(test)]
@@ -506,5 +707,91 @@ mod tests {
         let json = r#"{ "unknown_query": { "field": "value" } }"#;
         let result = QueryParser::parse_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_wildcard_simple() {
+        let json = r#"{ "wildcard": { "title": "prog*" } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "wildcard");
+    }
+
+    #[test]
+    fn test_parse_wildcard_with_boost() {
+        let json = r#"{ "wildcard": { "title": { "value": "prog*", "boost": 2.0 } } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "wildcard");
+        assert_eq!(query.boost(), 2.0);
+    }
+
+    #[test]
+    fn test_parse_prefix_simple() {
+        let json = r#"{ "prefix": { "title": "rust" } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "prefix");
+    }
+
+    #[test]
+    fn test_parse_prefix_with_boost() {
+        let json = r#"{ "prefix": { "title": { "value": "rust", "boost": 1.5 } } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "prefix");
+        assert_eq!(query.boost(), 1.5);
+    }
+
+    #[test]
+    fn test_parse_fuzzy_simple() {
+        let json = r#"{ "fuzzy": { "content": "roust" } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "fuzzy");
+    }
+
+    #[test]
+    fn test_parse_fuzzy_with_options() {
+        let json = r#"{ "fuzzy": { "content": { "value": "roust", "fuzziness": 1, "prefix_length": 2 } } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "fuzzy");
+    }
+
+    #[test]
+    fn test_parse_match_phrase_simple() {
+        let json = r#"{ "match_phrase": { "content": "rust programming" } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "phrase");
+    }
+
+    #[test]
+    fn test_parse_match_phrase_with_slop() {
+        let json = r#"{ "match_phrase": { "content": { "query": "rust programming", "slop": 2 } } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "phrase");
+    }
+
+    #[test]
+    fn test_parse_match_phrase_with_boost() {
+        let json = r#"{ "match_phrase": { "content": { "query": "rust programming", "boost": 2.5 } } }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "phrase");
+        assert_eq!(query.boost(), 2.5);
+    }
+
+    #[test]
+    fn test_parse_complex_with_new_queries() {
+        let json = r#"{
+            "bool": {
+                "must": [
+                    { "match_phrase": { "title": "rust programming" } }
+                ],
+                "should": [
+                    { "prefix": { "tags": "tut" } },
+                    { "fuzzy": { "author": "john" } }
+                ],
+                "must_not": [
+                    { "wildcard": { "status": "draft*" } }
+                ]
+            }
+        }"#;
+        let query = QueryParser::parse_str(json).unwrap();
+        assert_eq!(query.query_type(), "bool");
     }
 }
