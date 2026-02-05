@@ -24,6 +24,7 @@
 //! }
 //! ```
 
+pub mod accessor;
 pub mod ast;
 pub mod context;
 pub mod executor;
@@ -32,6 +33,7 @@ pub mod parser;
 pub mod planner;
 pub mod types;
 
+pub use accessor::{IndexAccessor, PostingEntry, SegmentAccessor, TermStats};
 pub use ast::{QueryNode, QueryNodeRef};
 pub use context::QueryContext;
 pub use executor::QueryExecutor;

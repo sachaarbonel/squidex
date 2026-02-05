@@ -14,6 +14,9 @@ use crate::config::IndexSettings;
 use crate::error::{Result, SquidexError};
 use crate::models::*;
 use crate::persistence::DocStore;
+use crate::query::accessor::{IndexAccessor, SegmentAccessor};
+use crate::query::ast::QueryNode;
+use crate::query::{QueryContext, QueryExecutor};
 use crate::segment::{SegmentIndex, SegmentIndexConfig};
 use crate::state_machine::indexer::{spawn_indexer, IndexOp};
 use crate::state_machine::scoring::*;
@@ -364,6 +367,49 @@ impl SearchStateMachine {
             .map(|r| SearchResult::new(r.doc_id, r.score))
             .take(top_k)
             .collect()
+    }
+
+    /// Execute a structured query using the Query DSL
+    pub fn structured_search(
+        &self,
+        query: Box<dyn QueryNode>,
+        top_k: usize,
+    ) -> Vec<SearchResult> {
+        if top_k == 0 {
+            return Vec::new();
+        }
+
+        // Build accessor with tombstone snapshot
+        let accessor = Arc::new(SegmentAccessor::new(
+            self.text_index.clone(),
+            &self.tombstone_index,
+        ));
+
+        // Get stats from accessor before wrapping
+        let total_docs = accessor.total_docs();
+        let avg_doc_length = accessor.avg_doc_length();
+
+        // Create a tokenizer for the query context
+        let settings = self.settings.read();
+        let tokenizer = Arc::new(Tokenizer::new(&settings.tokenizer_config));
+        drop(settings);
+
+        // Build context
+        let ctx = QueryContext::builder()
+            .total_docs(total_docs as usize)
+            .avg_doc_length(avg_doc_length)
+            .tokenizer(tokenizer)
+            .accessor(accessor)
+            .build();
+
+        // Execute
+        match QueryExecutor::execute(query, &ctx, top_k) {
+            Ok(result) => result.hits,
+            Err(e) => {
+                tracing::warn!("structured_search error: {}", e);
+                Vec::new()
+            }
+        }
     }
 
     pub fn vector_search(&self, query_embedding: &[f32], top_k: usize) -> Vec<SearchResult> {

@@ -167,29 +167,37 @@ pub async fn search(
         }
     }
 
-    let results = match req.mode {
-        SearchModeApi::Keyword => {
-            let query = req.query.ok_or_else(|| {
-                ApiError::BadRequest("query required for keyword search".to_string())
-            })?;
-            state.state_machine.keyword_search(&query, req.top_k)
-        }
-        SearchModeApi::Vector => {
-            let embedding = req.embedding.ok_or_else(|| {
-                ApiError::BadRequest("embedding required for vector search".to_string())
-            })?;
-            state.state_machine.vector_search(&embedding, req.top_k)
-        }
-        SearchModeApi::Hybrid => {
-            let query = req.query.ok_or_else(|| {
-                ApiError::BadRequest("query required for hybrid search".to_string())
-            })?;
-            let embedding = req.embedding.ok_or_else(|| {
-                ApiError::BadRequest("embedding required for hybrid search".to_string())
-            })?;
-            state
-                .state_machine
-                .hybrid_search(&query, &embedding, req.top_k, req.keyword_weight)
+    // If DSL is provided, use structured search
+    let results = if let Some(dsl) = &req.dsl {
+        let query = crate::query::QueryParser::parse(dsl)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid DSL query: {}", e)))?;
+        state.state_machine.structured_search(query, req.top_k)
+    } else {
+        // Fall back to existing search modes
+        match req.mode {
+            SearchModeApi::Keyword => {
+                let query = req.query.ok_or_else(|| {
+                    ApiError::BadRequest("query required for keyword search".to_string())
+                })?;
+                state.state_machine.keyword_search(&query, req.top_k)
+            }
+            SearchModeApi::Vector => {
+                let embedding = req.embedding.ok_or_else(|| {
+                    ApiError::BadRequest("embedding required for vector search".to_string())
+                })?;
+                state.state_machine.vector_search(&embedding, req.top_k)
+            }
+            SearchModeApi::Hybrid => {
+                let query = req.query.ok_or_else(|| {
+                    ApiError::BadRequest("query required for hybrid search".to_string())
+                })?;
+                let embedding = req.embedding.ok_or_else(|| {
+                    ApiError::BadRequest("embedding required for hybrid search".to_string())
+                })?;
+                state
+                    .state_machine
+                    .hybrid_search(&query, &embedding, req.top_k, req.keyword_weight)
+            }
         }
     };
 

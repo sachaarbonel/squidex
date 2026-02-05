@@ -2,6 +2,7 @@
 //!
 //! The `QueryContext` provides access to index data and caching during query execution.
 
+use crate::query::accessor::{IndexAccessor, PostingEntry, TermStats};
 use crate::segment::{DocNo, DocumentId};
 use crate::tokenizer::Tokenizer;
 use crate::Result;
@@ -48,6 +49,9 @@ pub struct QueryContext {
     /// Per-field term frequencies for BM25
     /// Key: "field:term", Value: (doc_frequency, total_term_frequency)
     field_term_stats: Arc<RwLock<HashMap<String, (u32, u64)>>>,
+
+    /// Index accessor for real posting list lookups
+    accessor: Option<Arc<dyn IndexAccessor>>,
 }
 
 impl QueryContext {
@@ -68,6 +72,7 @@ impl QueryContext {
             tokenizer,
             tombstones: Arc::new(RoaringBitmap::new()),
             field_term_stats: Arc::new(RwLock::new(HashMap::new())),
+            accessor: None,
         }
     }
 
@@ -173,7 +178,15 @@ impl QueryContext {
 
     /// Map internal DocNo to external document ID
     pub fn docno_to_doc_id(&self, docno: DocNo) -> Option<DocumentId> {
-        self.docno_to_doc_id.get(docno.as_usize()).copied()
+        // First try the direct mapping
+        if let Some(&doc_id) = self.docno_to_doc_id.get(docno.as_usize()) {
+            return Some(doc_id);
+        }
+        // Fall back to accessor if available
+        if let Some(accessor) = &self.accessor {
+            return accessor.docno_to_doc_id(docno);
+        }
+        None
     }
 
     /// Calculate BM25 IDF for a term
@@ -206,6 +219,35 @@ impl QueryContext {
         let norm = 1.0 - B + B * (dl / avgdl);
         idf * (tf * (K1 + 1.0)) / (tf + K1 * norm)
     }
+
+    /// Get the index accessor
+    pub fn accessor(&self) -> Option<&dyn IndexAccessor> {
+        self.accessor.as_ref().map(|a| a.as_ref())
+    }
+
+    /// Get postings for a term using the accessor
+    pub fn get_postings(&self, term: &str) -> Vec<PostingEntry> {
+        self.accessor
+            .as_ref()
+            .map(|a| a.postings(term))
+            .unwrap_or_default()
+    }
+
+    /// Get postings as a bitmap for a term using the accessor
+    pub fn get_postings_bitmap(&self, term: &str) -> RoaringBitmap {
+        self.accessor
+            .as_ref()
+            .map(|a| a.postings_bitmap(term))
+            .unwrap_or_default()
+    }
+
+    /// Get term statistics using the accessor
+    pub fn get_term_stats(&self, term: &str) -> TermStats {
+        self.accessor
+            .as_ref()
+            .map(|a| a.term_stats(term))
+            .unwrap_or_default()
+    }
 }
 
 /// Builder for QueryContext
@@ -218,6 +260,7 @@ pub struct QueryContextBuilder {
     doc_lengths: Vec<u32>,
     tokenizer: Option<Arc<Tokenizer>>,
     tombstones: RoaringBitmap,
+    accessor: Option<Arc<dyn IndexAccessor>>,
 }
 
 impl QueryContextBuilder {
@@ -263,6 +306,12 @@ impl QueryContextBuilder {
         self
     }
 
+    /// Set the index accessor
+    pub fn accessor(mut self, accessor: Arc<dyn IndexAccessor>) -> Self {
+        self.accessor = Some(accessor);
+        self
+    }
+
     /// Build the QueryContext
     pub fn build(self) -> QueryContext {
         let tokenizer = self
@@ -280,6 +329,7 @@ impl QueryContextBuilder {
             tokenizer,
             tombstones: Arc::new(self.tombstones),
             field_term_stats: Arc::new(RwLock::new(HashMap::new())),
+            accessor: self.accessor,
         }
     }
 }

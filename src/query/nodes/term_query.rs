@@ -49,21 +49,15 @@ impl TermQuery {
 
 impl QueryNode for TermQuery {
     fn execute(&self, ctx: &QueryContext) -> Result<RoaringBitmap> {
-        // For now, we return an empty bitmap as we need integration with
-        // the segment index to actually look up terms. This will be connected
-        // when integrating with the state machine.
-        //
-        // The actual implementation would:
-        // 1. Look up the term in the term dictionary
-        // 2. Read the posting list
-        // 3. Convert postings to a bitmap
-        // 4. Filter out tombstones
-
         let cache_key = self.cache_key();
         ctx.get_or_cache_filter(&cache_key, || {
-            // Placeholder: return empty bitmap
-            // Real implementation would query the segment index
-            Ok(RoaringBitmap::new())
+            // Get postings from the accessor
+            let postings = ctx.get_postings(&self.term);
+            let mut bitmap = RoaringBitmap::new();
+            for posting in postings {
+                bitmap.insert(posting.docno.as_u32());
+            }
+            Ok(bitmap)
         })
     }
 
@@ -92,15 +86,28 @@ impl QueryNode for TermQuery {
     }
 
     fn score(&self, ctx: &QueryContext, docno: u32) -> Option<f32> {
-        // BM25 scoring would be applied here
-        // For now, return a constant score
-        let doc_freq = ctx.doc_frequency(&self.cache_key());
-        if doc_freq > 0 {
-            let idf = ctx.bm25_idf(doc_freq);
-            Some(idf * self.boost)
-        } else {
-            None
+        // Get term statistics for IDF calculation
+        let stats = ctx.get_term_stats(&self.term);
+        if stats.doc_frequency == 0 {
+            return None;
         }
+
+        // Get postings to find term frequency for this doc
+        let postings = ctx.get_postings(&self.term);
+        let posting = postings
+            .iter()
+            .find(|p| p.docno.as_u32() == docno)?;
+
+        // Full BM25: IDF * (TF * (k1 + 1)) / (TF + k1 * (1 - b + b * dl/avgdl))
+        let idf = ctx.bm25_idf(stats.doc_frequency);
+        let tf = posting.term_frequency as f32;
+        let dl = posting.doc_length as f32;
+        let avgdl = ctx.avg_doc_length();
+        let k1 = 1.2f32;
+        let b = 0.75f32;
+
+        let norm = 1.0 - b + b * (dl / avgdl.max(1.0));
+        Some(idf * (tf * (k1 + 1.0)) / (tf + k1 * norm) * self.boost)
     }
 
     fn clone_box(&self) -> Box<dyn QueryNode> {

@@ -39,6 +39,9 @@ pub struct SearchRequestApi {
     pub min_index_applied_index: Option<u64>,
     #[serde(default)]
     pub wait_for: Option<u64>, // optional wait_for milliseconds until index_applied_index >= min
+    /// Query DSL for structured queries (optional, overrides query/mode if present)
+    #[serde(default)]
+    pub dsl: Option<serde_json::Value>,
 }
 
 fn default_keyword_weight() -> f32 {

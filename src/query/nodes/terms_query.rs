@@ -60,11 +60,12 @@ impl QueryNode for TermsQuery {
         let cache_key = self.cache_key();
         ctx.get_or_cache_filter(&cache_key, || {
             // Union of all term posting lists
-            // Real implementation would:
-            // 1. Look up each term in the term dictionary
-            // 2. Union all posting lists
-            // 3. Filter out tombstones
-            Ok(RoaringBitmap::new())
+            let mut result = RoaringBitmap::new();
+            for term in &self.terms {
+                let bitmap = ctx.get_postings_bitmap(term);
+                result |= bitmap;
+            }
+            Ok(result)
         })
     }
 
@@ -98,6 +99,37 @@ impl QueryNode for TermsQuery {
 
     fn boost(&self) -> f32 {
         self.boost
+    }
+
+    fn score(&self, ctx: &QueryContext, docno: u32) -> Option<f32> {
+        // Score is the sum of BM25 scores for all matching terms
+        let avgdl = ctx.avg_doc_length().max(1.0);
+        let k1 = 1.2f32;
+        let b = 0.75f32;
+
+        let mut total_score = 0.0f32;
+
+        for term in &self.terms {
+            let stats = ctx.get_term_stats(term);
+            if stats.doc_frequency == 0 {
+                continue;
+            }
+
+            let postings = ctx.get_postings(term);
+            if let Some(posting) = postings.iter().find(|p| p.docno.as_u32() == docno) {
+                let idf = ctx.bm25_idf(stats.doc_frequency);
+                let tf = posting.term_frequency as f32;
+                let dl = posting.doc_length as f32;
+                let norm = 1.0 - b + b * (dl / avgdl);
+                total_score += idf * (tf * (k1 + 1.0)) / (tf + k1 * norm);
+            }
+        }
+
+        if total_score > 0.0 {
+            Some(total_score * self.boost)
+        } else {
+            None
+        }
     }
 
     fn clone_box(&self) -> Box<dyn QueryNode> {

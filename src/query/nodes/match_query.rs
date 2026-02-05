@@ -103,17 +103,35 @@ impl QueryNode for MatchQuery {
 
         let cache_key = self.cache_key();
         ctx.get_or_cache_filter(&cache_key, || {
-            // Real implementation would:
-            // 1. Look up each term in the term dictionary
-            // 2. Get posting lists for each term
-            // 3. Based on operator:
-            //    - AND: intersect all posting lists
-            //    - OR: union all posting lists
-            // 4. Filter out tombstones
-            // 5. Apply minimum_should_match if specified
+            // Get posting bitmaps for each term
+            let bitmaps: Vec<RoaringBitmap> = terms
+                .iter()
+                .map(|term| ctx.get_postings_bitmap(term))
+                .collect();
 
-            // For now, return empty bitmap (placeholder)
-            Ok(RoaringBitmap::new())
+            if bitmaps.is_empty() {
+                return Ok(RoaringBitmap::new());
+            }
+
+            // Combine based on operator
+            let result = match self.operator {
+                MatchOperator::And => {
+                    // Intersect all bitmaps
+                    bitmaps
+                        .into_iter()
+                        .reduce(|a, b| a & b)
+                        .unwrap_or_default()
+                }
+                MatchOperator::Or => {
+                    // Union all bitmaps
+                    bitmaps
+                        .into_iter()
+                        .reduce(|a, b| a | b)
+                        .unwrap_or_default()
+                }
+            };
+
+            Ok(result)
         })
     }
 
@@ -158,23 +176,31 @@ impl QueryNode for MatchQuery {
         self.boost
     }
 
-    fn score(&self, ctx: &QueryContext, _docno: u32) -> Option<f32> {
-        // Full BM25 scoring would aggregate scores from all matching terms
-        // For now, return a placeholder based on IDF of terms
+    fn score(&self, ctx: &QueryContext, docno: u32) -> Option<f32> {
+        // Full BM25 scoring - aggregate scores from all matching terms
         let terms = self.analyze(ctx);
+        let avgdl = ctx.avg_doc_length().max(1.0);
+        let k1 = 1.2f32;
+        let b = 0.75f32;
 
-        let total_score: f32 = terms
-            .iter()
-            .map(|term| {
-                let key = format!("term:{}:{}", self.field, term);
-                let doc_freq = ctx.doc_frequency(&key);
-                if doc_freq > 0 {
-                    ctx.bm25_idf(doc_freq)
-                } else {
-                    0.0
-                }
-            })
-            .sum();
+        let mut total_score = 0.0f32;
+
+        for term in &terms {
+            let stats = ctx.get_term_stats(term);
+            if stats.doc_frequency == 0 {
+                continue;
+            }
+
+            // Find this term's posting for docno
+            let postings = ctx.get_postings(term);
+            if let Some(posting) = postings.iter().find(|p| p.docno.as_u32() == docno) {
+                let idf = ctx.bm25_idf(stats.doc_frequency);
+                let tf = posting.term_frequency as f32;
+                let dl = posting.doc_length as f32;
+                let norm = 1.0 - b + b * (dl / avgdl);
+                total_score += idf * (tf * (k1 + 1.0)) / (tf + k1 * norm);
+            }
+        }
 
         if total_score > 0.0 {
             Some(total_score * self.boost)

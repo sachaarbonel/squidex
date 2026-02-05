@@ -368,7 +368,7 @@ impl SegmentIndex {
     }
 
     /// Compute global statistics across buffer and segments
-    fn compute_global_stats(&self) -> (u32, f64) {
+    pub fn compute_global_stats(&self) -> (u32, f64) {
         let mut total_docs = 0u32;
         let mut total_length = 0u64;
 
@@ -429,6 +429,16 @@ impl SegmentIndex {
     /// Get the manifest
     pub fn manifest(&self) -> &ManifestHolder {
         &self.manifest
+    }
+
+    /// Get access to the buffer
+    pub fn buffer(&self) -> &RwLock<MutableBuffer> {
+        &self.buffer
+    }
+
+    /// Get access to the segments
+    pub fn segments(&self) -> Arc<Vec<Arc<SegmentReader>>> {
+        self.segments.load_full()
     }
 
     /// Check if document exists
